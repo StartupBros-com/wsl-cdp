@@ -2,6 +2,17 @@
 
 All notable changes to wsl-cdp. Format follows [Keep a Changelog](https://keepachangelog.com/); versions are [GitHub releases](https://github.com/StartupBros-com/wsl-cdp/releases).
 
+## [0.3.4] — 2026-08-08
+
+**Interop-outage immunity + the `upload` verb.** Born from a live outage: WSL's vsock interop wedged mid-session (`accept4 failed 110`), hanging `setup-windows` past 300 s and misleading `doctor` into a "no portproxy rule" verdict.
+
+- Every Windows-exe call (`netsh`, `cmd`, `powershell`, `tasklist`, `wsl.exe`) now runs under a per-call timeout (`WSL_CDP_WIN_EXEC_TIMEOUT`, default 8 s) — a wedged channel can no longer hang any verb.
+- `doctor` gains an explicit `interop` row, and no longer reports "no portproxy rule" when netsh's answer is unverifiable.
+- `up` and `setup-windows` detect a dead channel and print the Windows-side recovery (staged elevated `.ps1` + `print-launch --windows`) instead of misdiagnosing the firewall; `up` adopts a hand-launched browser.
+- New `print-launch --windows`: the launch command PowerShell-paste-ready (Windows paths via `wslpath`, all args quoted).
+- New `upload FILE SELECTOR [TAB]`: sets a file on a page's file input over CDP and fires the events its JS listens for — drives upload UIs that have no API (proven against GitHub's repo social-preview). Linux-side files are staged to the Windows side automatically.
+- Skill/setup docs: the installed CLI outranks cached plugin text when they disagree.
+
 ## [0.3.3] — 2026-08-08
 
 **Enforced profile hygiene: the agent profile keeps sessions, never passwords.**

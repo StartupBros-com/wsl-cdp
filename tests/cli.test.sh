@@ -301,6 +301,93 @@ assert_eq "up over a live bridge exits 0" 0 "$up_rc"
 assert_contains "up warns when the browser override is not applied" "$up_err" "WSL_CDP_BROWSER is set"
 assert_contains "up without an override stays note-free" "$up_out" "bridge up: FakeBrowser"
 
+# --- interop-outage immunity (v0.3.4): a wedged vsock channel HANGS Windows
+#     exes instead of failing them; every verb must survive via win_exec
+#     timeouts and say the true thing instead of misdiagnosing
+fx5="$(make_fixture)"
+mkdir -p "$fx5/hang"
+for exe in cmd.exe netsh.exe powershell.exe tasklist.exe wsl.exe; do
+  printf '#!/usr/bin/env bash\nsleep 60\n' >"$fx5/hang/$exe"
+  chmod +x "$fx5/hang/$exe"
+done
+doc_out="$(WSL_CDP_WIN_EXEC_TIMEOUT=1 PATH="$fx5/hang:$PATH" \
+  WSL_CDP_USERS_ROOT="$fx5/users" WSL_CDP_WINUSER=testuser HOME="$fx5/home" \
+  WSL_CDP_PORT=9333 WSL_CDP_PROXY_PORT=9334 timeout 60 "$CLI" doctor 2>&1)"
+doc_rc=$?
+if [ "$doc_rc" = 124 ]; then _no "doctor HUNG under wedged interop"; else _ok "doctor survives wedged interop"; fi
+assert_contains "doctor names the interop outage" "$doc_out" "WARN interop"
+assert_contains "doctor refuses the no-rule misread" "$doc_out" "unverifiable: interop down"
+case "$doc_out" in *"no v4tov4 rule"*) _no "doctor still claims no-rule under dead netsh" ;; *) _ok "no false no-rule claim under dead netsh" ;; esac
+
+up_err2="$(WSL_CDP_WIN_EXEC_TIMEOUT=1 PATH="$fx5/hang:$PATH" \
+  WSL_CDP_USERS_ROOT="$fx5/users" WSL_CDP_WINUSER=testuser HOME="$fx5/home" \
+  WSL_CDP_PORT=9333 WSL_CDP_PROXY_PORT=9334 timeout 60 "$CLI" up 2>&1 >/dev/null)"
+up_rc2=$?
+assert_eq "up under wedged interop -> 1" 1 "$up_rc2"
+assert_contains "up hands the Windows-side rescue" "$up_err2" "print-launch --windows"
+if [ -f "$fx5/users/testuser/.wsl-cdp/wsl-cdp-setup.ps1" ]; then
+  _ok "up staged the elevated setup script via 9p"
+else
+  _no "rescue did not stage wsl-cdp-setup.ps1"
+fi
+
+# --- print-launch --windows: PowerShell-paste-ready
+pw="$(WSL_CDP_USERS_ROOT="$fx5/users" WSL_CDP_WINUSER=testuser HOME="$fx5/home" \
+  WSL_CDP_BROWSER="$(fixture_brave "$fx5")" WSL_CDP_PORT=9333 "$CLI" print-launch --windows)"
+case "$pw" in '& "'*) _ok "print-launch --windows uses the call operator" ;; *) _no "unexpected --windows prefix: $pw" ;; esac
+assert_contains "--windows quotes wildcard args" "$pw" '"--remote-allow-origins=*"'
+assert_exit "print-launch --bogus -> 2" 2 "$CLI" print-launch --bogus
+
+# --- upload: argument validation fires before any network dependency
+assert_exit "upload (no args) -> 2" 2 "$CLI" upload
+assert_exit "upload (one arg) -> 2" 2 "$CLI" upload /tmp/x
+assert_exit "upload missing file -> 2" 2 "$CLI" upload /nonexistent-file.png "input"
+
+# --- v0.3.4 review fixes: config validation, JSON parity, gated latency,
+#     honest rescue without a resolvable user, staged-upload hygiene
+assert_exit "WIN_EXEC_TIMEOUT=abc -> 2" 2 env WSL_CDP_WIN_EXEC_TIMEOUT=abc "$CLI" url
+
+dj="$(WSL_CDP_WIN_EXEC_TIMEOUT=1 PATH="$fx5/hang:$PATH" \
+  WSL_CDP_USERS_ROOT="$fx5/users" WSL_CDP_WINUSER=testuser HOME="$fx5/home" \
+  WSL_CDP_PORT=9333 WSL_CDP_PROXY_PORT=9334 timeout 60 "$CLI" doctor --json 2>/dev/null)"
+if printf '%s' "$dj" | jq -e '.env.interop == false' >/dev/null 2>&1; then
+  _ok "doctor --json carries env.interop=false under the wedge"
+else
+  _no "doctor --json missing/wrong interop field: $(printf '%s' "$dj" | jq -c '.env // empty' 2>/dev/null)"
+fi
+
+# gated wedge latency: pre-gate code took >=16s at a 2s timeout (3x netsh retry
+# + wsl.exe + stale netsh each independently re-probed); gated must stay well under
+wedge_s=$(date +%s)
+WSL_CDP_WIN_EXEC_TIMEOUT=2 PATH="$fx5/hang:$PATH" \
+  WSL_CDP_USERS_ROOT="$fx5/users" WSL_CDP_WINUSER=testuser HOME="$fx5/home" \
+  WSL_CDP_PORT=9333 WSL_CDP_PROXY_PORT=9334 timeout 60 "$CLI" doctor >/dev/null 2>&1
+wedge_e=$(date +%s)
+if [ $((wedge_e - wedge_s)) -lt 15 ]; then
+  _ok "wedged doctor short-circuits on the interop verdict ($((wedge_e - wedge_s))s)"
+else
+  _no "wedged doctor too slow: $((wedge_e - wedge_s))s (gates not consulted?)"
+fi
+
+# rescue with NO resolvable Windows user: must not name a file it never staged
+mkdir -p "$fx5/empty-users"
+resc="$(WSL_CDP_WIN_EXEC_TIMEOUT=1 PATH="$fx5/hang:$PATH" \
+  WSL_CDP_USERS_ROOT="$fx5/empty-users" HOME="$fx5/home2" \
+  WSL_CDP_PORT=9333 WSL_CDP_PROXY_PORT=9334 timeout 60 "$CLI" up 2>&1 >/dev/null)"
+assert_contains "unresolvable-user rescue says copy-it-yourself" "$resc" "copy "
+case "$resc" in *'C:\Users\<you>'*) _no "rescue still prints a placeholder staged path" ;; *) _ok "no phantom staged-script path" ;; esac
+
+# staged uploads are cleared by harden and flagged by nothing afterwards
+mkdir -p "$fx4/users/testuser/.wsl-cdp/uploads"
+printf 'x' >"$fx4/users/testuser/.wsl-cdp/uploads/leftover.bin"
+h_out="$(harden_run)"
+assert_contains "harden clears staged uploads" "$h_out" "cleared 1 staged upload"
+if [ -f "$fx4/users/testuser/.wsl-cdp/uploads/leftover.bin" ]; then
+  _no "staged upload survived harden"
+else
+  _ok "staged upload removed by harden"
+fi
+
 # --- status --json: valid JSON, documented shape, ok:false when the chain is down
 sj="$(WSL_CDP_PORT=9333 WSL_CDP_PROXY_PORT=9334 "$CLI" status --json 2>/dev/null)"
 if printf '%s' "$sj" | jq -e '.ok==false and (.exit|type=="number") and (.checks|length==3) and (.checks[0]|has("status") and has("name") and has("detail"))' >/dev/null 2>&1; then

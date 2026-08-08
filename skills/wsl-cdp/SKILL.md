@@ -5,6 +5,8 @@ description: Drive the user's real, logged-in Windows browser (Chrome, Edge, or 
 
 # wsl-cdp: the user's real Windows browser, from WSL2
 
+If this document and the installed `wsl-cdp --help` disagree (plugin-cache lag), the installed CLI wins — trust its verbs and messages over this text.
+
 ## Route first
 
 1. Confirm WSL2: `grep -qi microsoft /proc/version`. If that fails you are NOT in WSL — stop and use the official Claude in Chrome extension instead (`claude --chrome`); this tool is pointless there.
