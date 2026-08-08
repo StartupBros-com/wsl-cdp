@@ -60,11 +60,12 @@ Or clone and symlink `wsl-cdp` onto your PATH; the scripts resolve their sibling
 | `status [--json]` / `doctor [--json]` | per-link health, exit code = first broken link, remediation attached; `--json` emits `{ok, exit, checks:[…]}` for scripts |
 | `tabs [--json]` / `open URL` / `close ID` | tab management (HTTP CDP endpoints) |
 | `eval JS [TAB]` / `text [TAB]` / `screenshot [FILE] [TAB]` | page access over the WebSocket layer (needs node ≥ 22) |
+| `browsers [--json]` | installed browsers in autodetect rank order, flagged `recommended` / `running` / `recorded`; `--json` adds which one `up` would use (`selected` + `source`) — the input for an explicit browser choice at setup time |
 | `print-launch` | show the exact browser command line (port + profile are emitted as a unit) |
 | `setup-windows` | the one elevated step, once; idempotent |
 | `mcp-add` | write a per-repo `.mcp.json` entry for `chrome-devtools-mcp --browserUrl=http://127.0.0.1:9223` |
 
-`tabs` and `open` print tab-separated rows: `<id>\t<url>` (one page target per line) — pipe to `cut -f1` for ids, `cut -f2` for urls. `tabs --json` gives `[{id, url}, …]` instead.
+`tabs` and `open` print tab-separated rows: `<id>\t<url>` (one page target per line) — pipe to `cut -f1` for ids, `cut -f2` for urls. `tabs --json` gives `[{id, url}, …]` instead. `browsers` prints `<rank>\t<name>\t<path>\t<flags>` (flags comma-joined, `-` when none); its `--json` shape is `{browsers: [{rank, name, path, running, recorded, recommended}], selected, source}` with `running` null when Windows interop is down (unknown, never assumed false).
 
 **Exit codes:** `0` ok · `1` chain/forwarder down (or a CDP call failed after the chain proved healthy) · `2` usage error / invalid argument / unknown flag · `3` end-to-end check failed. Unknown flags and stray arguments are rejected loudly rather than ignored, so a wrong guess never returns a false success.
 

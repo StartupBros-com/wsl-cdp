@@ -86,6 +86,116 @@ else
   _ok "override leaves the winuser cache unwritten"
 fi
 
+# --- browsers verb (v0.3.2): rank-ordered enumeration, flags, machine shape.
+#     Fresh fixture: the waterfall above deleted $fx's browsers. A shimmed
+#     no-output tasklist.exe ("interop down") makes `running` deterministic on
+#     real WSL boxes, where the genuine tasklist would answer.
+fx2="$(make_fixture)"
+mkdir -p "$fx2/bin-down"
+printf '#!/usr/bin/env bash\nexit 0\n' >"$fx2/bin-down/tasklist.exe"
+chmod +x "$fx2/bin-down/tasklist.exe"
+browsers_run(){ PATH="$fx2/bin-down:$PATH" WSL_CDP_USERS_ROOT="$fx2/users" \
+  WSL_CDP_WINUSER=testuser \
+  WSL_CDP_PROGRAMFILES="$fx2/pf" WSL_CDP_PROGRAMFILES_X86="$fx2/pf86" \
+  HOME="$fx2/home" "$CLI" browsers "$@" 2>/dev/null; }
+bt="$(browsers_run)"
+assert_eq "browsers lists all six installs" 6 "$(printf '%s\n' "$bt" | wc -l)"
+assert_contains "browsers rank 1 is system Chrome" "$(printf '%s\n' "$bt" | head -1)" "pf/Google/Chrome"
+assert_contains "browsers rank 1 carries recommended" "$(printf '%s\n' "$bt" | head -1)" "recommended"
+assert_exit "browsers --xml -> 2" 2 "$CLI" browsers --xml
+assert_exit "browsers stray positional -> 2" 2 "$CLI" browsers stray
+
+bj="$(browsers_run --json)"
+if printf '%s' "$bj" | jq -e --arg p "$(fixture_chrome "$fx2")" '
+     (.browsers|length)==6 and .browsers[0].name=="chrome"
+     and .browsers[0].recommended==true and .browsers[0].running==null
+     and .source=="autodetect" and .selected==$p' >/dev/null 2>&1; then
+  _ok "browsers --json well-shaped (running null when interop absent)"
+else
+  _no "browsers --json shape wrong: $bj"
+fi
+
+# --- browsers: a recorded profile owner is flagged and wins selection
+mkdir -p "$fx2/users/testuser/.wsl-cdp"
+printf '%s' "$(fixture_brave "$fx2")" >"$fx2/users/testuser/.wsl-cdp/browser"
+bj="$(browsers_run --json)"
+if printf '%s' "$bj" | jq -e --arg p "$(fixture_brave "$fx2")" '
+     .source=="recorded" and .selected==$p
+     and ([.browsers[]|select(.recorded)] | length==1 and all(.name=="brave"))' >/dev/null 2>&1; then
+  _ok "browsers --json surfaces the recorded profile owner"
+else
+  _no "browsers --json recorded shape wrong: $bj"
+fi
+rm -f "$fx2/users/testuser/.wsl-cdp/browser"
+
+# --- browsers: running flags through a tasklist.exe seam (brave live, rest not)
+mkdir -p "$fx2/bin"
+cat >"$fx2/bin/tasklist.exe" <<'SHIM'
+#!/usr/bin/env bash
+case "$*" in
+  *brave.exe*) printf '"brave.exe","4242","Console","1","123,456 K"\n' ;;
+  *) printf 'INFO: No tasks are running which match the specified criteria.\n' ;;
+esac
+SHIM
+chmod +x "$fx2/bin/tasklist.exe"
+bj="$(PATH="$fx2/bin:$PATH" WSL_CDP_USERS_ROOT="$fx2/users" WSL_CDP_WINUSER=testuser \
+  WSL_CDP_PROGRAMFILES="$fx2/pf" WSL_CDP_PROGRAMFILES_X86="$fx2/pf86" \
+  HOME="$fx2/home" "$CLI" browsers --json 2>/dev/null)"
+if printf '%s' "$bj" | jq -e '
+     ([.browsers[]|select(.name=="brave")] | length==2 and all(.running==true))
+     and ([.browsers[]|select(.name!="brave")] | length==4 and all(.running==false))' >/dev/null 2>&1; then
+  _ok "browsers running flags via tasklist seam"
+else
+  _no "browsers running flags wrong: $bj"
+fi
+
+# --- browsers: a non-executable env override is previewed with a loud WARN
+#     (selected/source document what `up` would use, and `up` would FAIL here)
+b_err="$(WSL_CDP_USERS_ROOT="$fx2/users" WSL_CDP_WINUSER=testuser \
+  WSL_CDP_PROGRAMFILES="$fx2/pf" WSL_CDP_PROGRAMFILES_X86="$fx2/pf86" \
+  HOME="$fx2/home" WSL_CDP_BROWSER="$fx2/nope.exe" \
+  "$CLI" browsers --json 2>&1 >/dev/null)"
+assert_contains "browsers warns on a non-executable override" "$b_err" "not executable"
+
+# --- browsers: zero installs is a loud exit 1, not an empty success
+fx3="$(mktemp -d "${TMPDIR:-/tmp}/wslcdp-none.XXXXXX")"
+mkdir -p "$fx3/users/testuser/AppData/Local/Temp" "$fx3/home"
+assert_exit "browsers with no installs -> 1" 1 env WSL_CDP_USERS_ROOT="$fx3/users" \
+  WSL_CDP_WINUSER=testuser WSL_CDP_PROGRAMFILES="$fx3/pf" \
+  WSL_CDP_PROGRAMFILES_X86="$fx3/pf86" HOME="$fx3/home" "$CLI" browsers
+
+# --- up over an already-live bridge with WSL_CDP_BROWSER set: the explicit
+#     choice must not be DISCARDED silently (v0.3.2 review blocker). Fake
+#     /json/version server on a scratch port makes up return at step 0 —
+#     nothing is launched, no Windows state is touched.
+srv_port=9345
+python3 - "$srv_port" >/dev/null 2>&1 <<'PY' &
+import http.server, json, sys
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        b = json.dumps({"Browser": "FakeBrowser/1.0"}).encode()
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(b)))
+        self.end_headers()
+        self.wfile.write(b)
+    def log_message(self, *a):
+        pass
+http.server.HTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
+PY
+srv_pid=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  curl -sf -m 1 "http://127.0.0.1:$srv_port/json/version" >/dev/null 2>&1 && break
+  sleep 0.2
+done
+up_err="$(WSL_CDP_PORT=$srv_port WSL_CDP_PROXY_PORT=9346 \
+  WSL_CDP_BROWSER=/mnt/c/fake/browser.exe "$CLI" up 2>&1 >/dev/null)"
+up_rc=$?
+up_out="$(WSL_CDP_PORT=$srv_port WSL_CDP_PROXY_PORT=9346 "$CLI" up 2>/dev/null)"
+kill "$srv_pid" 2>/dev/null
+assert_eq "up over a live bridge exits 0" 0 "$up_rc"
+assert_contains "up warns when the browser override is not applied" "$up_err" "WSL_CDP_BROWSER is set"
+assert_contains "up without an override stays note-free" "$up_out" "bridge up: FakeBrowser"
+
 # --- status --json: valid JSON, documented shape, ok:false when the chain is down
 sj="$(WSL_CDP_PORT=9333 WSL_CDP_PROXY_PORT=9334 "$CLI" status --json 2>/dev/null)"
 if printf '%s' "$sj" | jq -e '.ok==false and (.exit|type=="number") and (.checks|length==3) and (.checks[0]|has("status") and has("name") and has("detail"))' >/dev/null 2>&1; then

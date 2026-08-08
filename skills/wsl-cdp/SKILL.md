@@ -37,6 +37,7 @@ Run `/wsl-cdp:setup` for the guided version. The shape:
 | `wsl-cdp eval 'JS' [TAB]` | evaluate in the page (returnByValue JSON) |
 | `wsl-cdp screenshot [FILE] [TAB]` | PNG of the rendered page; Read the file to see it |
 | `wsl-cdp mcp-add` | per-repo chrome-devtools-mcp wiring for deep work (network traces, many-step interactions); needs a session restart |
+| `wsl-cdp browsers --json` | installed browsers in rank order + which one `up` would use; `recommended`/`running`/`recorded` flags — the input for the setup flow's explicit browser choice |
 
 Trust `doctor` over guesswork: every known failure mode (stale portproxy rule, rebooted-host IP change, firewall, wrong port pair) is detected with a remediation line.
 
