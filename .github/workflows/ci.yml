@@ -10,7 +10,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: shellcheck
-        run: shellcheck -S warning wsl-cdp install.sh
+        run: shellcheck -S warning wsl-cdp install.sh tests/run.sh tests/lib.sh tests/*.test.sh
       - name: bash syntax
         run: bash -n wsl-cdp && bash -n install.sh
       - name: python syntax
@@ -23,3 +23,13 @@ jobs:
           $errs = $null
           [System.Management.Automation.Language.Parser]::ParseFile("$PWD/wsl-cdp-setup.ps1", [ref]$null, [ref]$errs) | Out-Null
           if ($errs.Count -gt 0) { $errs; exit 1 }
+
+  behavioral:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: run behavioral test suite
+        run: bash tests/run.sh

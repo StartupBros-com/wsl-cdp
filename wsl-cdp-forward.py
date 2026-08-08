@@ -26,9 +26,17 @@ async def pipe(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> No
     except (ConnectionResetError, BrokenPipeError, TimeoutError, OSError):
         pass
     finally:
+        # Half-close ONLY this direction (write_eof), never the whole transport.
+        # CDP is full-duplex: when the client finishes its request, a multi-MB
+        # screenshot frame may still be streaming back the other way. Calling
+        # writer.close() here (the pre-0.3.0 bug) tore the shared connection and
+        # truncated that reverse stream. write_eof signals "no more from me"
+        # while leaving the reverse pipe free to drain; handle() does the full
+        # close once BOTH directions are done.
         try:
-            writer.close()
-        except Exception:
+            if writer.can_write_eof():
+                writer.write_eof()
+        except (OSError, RuntimeError):
             pass
 
 
@@ -41,7 +49,16 @@ async def handle(client_r, client_w, host: str, port: int) -> None:
         print(f"connect {host}:{port} failed: {e}", file=sys.stderr, flush=True)
         client_w.close()
         return
-    await asyncio.gather(pipe(client_r, remote_w), pipe(remote_r, client_w))
+    try:
+        await asyncio.gather(pipe(client_r, remote_w), pipe(remote_r, client_w))
+    finally:
+        # Both directions have signalled EOF (or errored): now fully close both
+        # ends of the shared connection.
+        for w in (remote_w, client_w):
+            try:
+                w.close()
+            except OSError:
+                pass
 
 
 async def main() -> None:
