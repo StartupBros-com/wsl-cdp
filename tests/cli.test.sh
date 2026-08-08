@@ -46,6 +46,35 @@ assert_eq "print-launch exits 0" 0 "$rc"
 assert_contains "print-launch carries the debug port" "$argv" "--remote-debugging-port=9333"
 assert_contains "print-launch pairs the dedicated profile" "$argv" 'user-data-dir=C:\Users\testuser\.wsl-cdp\profile'
 
+# --- launch argv suppresses in-process updater/background churn (v0.3.1:
+#     a fresh agent profile must not kick off update churn; Brave relaunch loop)
+assert_contains "argv disables background networking" "$argv" "--disable-background-networking"
+assert_contains "argv stretches the component-update interval" "$argv" "--component-update-interval-in-sec="
+assert_contains "argv stretches the staged-update poll" "$argv" "--check-for-update-interval="
+
+# --- profile-browser affinity: the browser recorded next to the profile
+#     outranks autodetect (v0.3.1: an autodetect reorder must never reopen an
+#     existing profile with a different vendor); a stale record falls through
+detect_argv(){ WSL_CDP_USERS_ROOT="$fx/users" WSL_CDP_WINUSER=testuser \
+  WSL_CDP_PROGRAMFILES="$fx/pf" WSL_CDP_PROGRAMFILES_X86="$fx/pf86" \
+  HOME="$fx/home" "$CLI" print-launch 2>/dev/null; }
+mkdir -p "$fx/users/testuser/.wsl-cdp"
+printf '%s' "$(fixture_brave "$fx")" >"$fx/users/testuser/.wsl-cdp/browser"
+assert_contains "recorded profile browser outranks autodetect" "$(detect_argv)" "BraveSoftware"
+printf '%s' "$fx/uninstalled.exe" >"$fx/users/testuser/.wsl-cdp/browser"
+assert_contains "stale profile record falls back to autodetect" "$(detect_argv)" "pf/Google/Chrome"
+rm -f "$fx/users/testuser/.wsl-cdp/browser"
+
+# --- autodetect waterfall: the FULL documented order — Chrome (system, user),
+#     Edge (x86, 64-bit), Brave (user, system) — asserted by deleting the
+#     winner one rank at a time (v0.3.1: Brave last, updater contention)
+i=0
+while IFS= read -r exe; do
+  i=$((i+1))
+  assert_contains "autodetect rank $i is ${exe#"$fx"/}" "$(detect_argv)" "${exe#"$fx"/}"
+  rm "$exe"
+done < <(fixture_rank "$fx")
+
 # --- a WSL_CDP_WINUSER override must NOT persist into the winuser cache
 h="$fx/home2"
 WSL_CDP_USERS_ROOT="$fx/users" WSL_CDP_WINUSER=testuser \
