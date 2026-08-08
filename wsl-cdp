@@ -1,0 +1,277 @@
+#!/usr/bin/env bash
+# wsl-cdp — let AI agents (or you) in WSL2 drive a REAL, logged-in Windows
+# browser (Brave/Chrome/Edge) over the Chrome DevTools Protocol.
+#
+# Why this exists: extension-based agent-browser integrations (e.g. Claude in
+# Chrome) ride a native messaging host — the browser spawns the CLI as a child
+# process, which cannot cross the WSL2 VM boundary. The working path is raw CDP
+# into a dedicated, persistently-logged-in profile, bridged across the NAT.
+#
+# Chain (every hop loopback-or-WSL-subnet only; nothing LAN-exposed):
+#   WSL 127.0.0.1:9223 (wsl-cdp-forward.py)
+#     -> WIN_IP:9224   (netsh portproxy; one-time elevated `wsl-cdp setup-windows`)
+#     -> 127.0.0.1:9223 browser --remote-debugging-port (dedicated profile)
+#
+# Load-bearing details (each is a documented failure mode if changed):
+#   - WSL listen port MUST equal the browser's debug port: DevTools echoes the
+#     request Host header into webSocketDebuggerUrl, so the advertised
+#     ws://127.0.0.1:9223/... only resolves from WSL if the local forward
+#     listens on that same port.
+#   - portproxy listens on 9224 != 9223 so its wildcard bind can never race the
+#     browser's own 127.0.0.1:9223 bind (the stale-rule [::1] self-loop trap).
+#   - Chromium 136+ silently IGNORES --remote-debugging-port on the default
+#     profile; the dedicated profile is both mandatory and the security
+#     boundary (never point agents at your primary profile).
+#
+# Usage: wsl-cdp <up|down|status|doctor|url|tabs|open URL|close ID|
+#                 eval JS [TAB]|text [TAB]|screenshot [FILE] [TAB]|
+#                 print-launch|setup-windows|mcp-add>
+# Env:   WSL_CDP_PORT=9223  WSL_CDP_PROXY_PORT=9224
+#        WSL_CDP_WINUSER=<Windows username>  WSL_CDP_BROWSER=/mnt/c/.../browser.exe
+set -uo pipefail
+
+HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+PORT="${WSL_CDP_PORT:-9223}"
+PROXY_PORT="${WSL_CDP_PROXY_PORT:-9224}"
+STATE="$HOME/.local/state/wsl-cdp"
+FWD="$HERE/wsl-cdp-forward.py"
+DRIVE="$HERE/wsl-cdp-drive.mjs"
+
+detect_winuser() {
+  # cmd.exe echoes the session's username; stderr suppressed (UNC-cwd warning).
+  # Interop can be flaky, so fall back to the unique real dir under /mnt/c/Users.
+  local u d cands=()
+  u="$(cmd.exe /c 'echo %USERNAME%' 2>/dev/null | tr -d '\r\n')"
+  if [ -n "$u" ] && [ -d "/mnt/c/Users/$u" ]; then printf '%s' "$u"; return; fi
+  for d in /mnt/c/Users/*/; do
+    d="${d%/}"; d="${d##*/}"
+    case "$d" in Public|Default|"Default User"|"All Users") continue ;; esac
+    cands+=("$d")
+  done
+  [ ${#cands[@]} -eq 1 ] && printf '%s' "${cands[0]}"
+}
+
+WINUSER="${WSL_CDP_WINUSER:-$(detect_winuser)}"
+[ -n "$WINUSER" ] || { echo "wsl-cdp: cannot detect the Windows username (multiple profiles under /mnt/c/Users?). Set WSL_CDP_WINUSER." >&2; exit 1; }
+WINHOME="/mnt/c/Users/$WINUSER"
+
+detect_browser() { # first hit wins: Brave (user, system), Chrome (system, user), Edge
+  local c
+  for c in \
+    "$WINHOME/AppData/Local/BraveSoftware/Brave-Browser/Application/brave.exe" \
+    "/mnt/c/Program Files/BraveSoftware/Brave-Browser/Application/brave.exe" \
+    "/mnt/c/Program Files/Google/Chrome/Application/chrome.exe" \
+    "$WINHOME/AppData/Local/Google/Chrome/Application/chrome.exe" \
+    "/mnt/c/Program Files (x86)/Microsoft/Edge/Application/msedge.exe"; do
+    [ -x "$c" ] && { printf '%s' "$c"; return; }
+  done
+}
+
+BROWSER_EXE="${WSL_CDP_BROWSER:-$(detect_browser)}"
+WIN_DOT="C:\\Users\\$WINUSER\\.wsl-cdp"
+WIN_PROFILE="$WIN_DOT\\profile"
+
+win_ip() { ip route show default | awk '{print $3; exit}'; }
+
+launch_argv() {
+  # --remote-debugging-port and --user-data-dir are a UNIT: Chromium 136+
+  # silently ignores the former without the latter. Do not split them.
+  printf '%s\n' \
+    "--remote-debugging-port=$PORT" \
+    "--user-data-dir=$WIN_PROFILE" \
+    "--remote-allow-origins=*" \
+    "--no-first-run" \
+    "--no-default-browser-check"
+}
+
+listener_of() { # listener_of PORT -> "pid comm" of any local listener, empty if none
+  ss -ltnpH "sport = :$1" 2>/dev/null | head -1 \
+    | grep -oP 'pid=\K[0-9]+' | head -1 | while read -r p; do
+        printf '%s %s' "$p" "$(tr -d '\0' </proc/"$p"/comm 2>/dev/null || echo '?')"
+      done
+}
+
+fwd_running() { pgrep -f "wsl-cdp-forward.py.*--listen-port $PORT" >/dev/null 2>&1; }
+
+portproxy_rule() { # prints the portproxy rule line for PROXY_PORT, empty if none
+  # netsh.exe rides WSL interop, which can transiently fail (vsock errors) and
+  # return empty-with-exit-0. Retry so a one-off blip never reads as "rule
+  # missing" — that false negative would block `up` entirely.
+  local out i
+  for i in 1 2 3; do
+    out="$(netsh.exe interface portproxy show v4tov4 2>/dev/null | tr -d '\r' \
+      | awk -v p="$PROXY_PORT" '$2 == p {print}')"
+    [ -n "$out" ] && { printf '%s' "$out"; return 0; }
+    [ "$i" -lt 3 ] && sleep 1
+  done
+  return 0
+}
+
+e2e() { curl -sf -m 3 "http://127.0.0.1:$PORT/json/version"; }
+winside() { curl -sf -m 3 "http://$(win_ip):$PROXY_PORT/json/version"; }
+
+start_forwarder() {
+  mkdir -p "$STATE"
+  setsid nohup python3 "$FWD" --listen-port "$PORT" \
+    --target-host "$(win_ip)" --target-port "$PROXY_PORT" \
+    >>"$STATE/forwarder.log" 2>&1 &
+  sleep 0.4
+}
+
+launch_browser() {
+  local args=() a
+  while IFS= read -r a; do args+=("$a"); done < <(launch_argv)
+  "$BROWSER_EXE" "${args[@]}" >/dev/null 2>&1 &
+  disown
+}
+
+cmd_up() {
+  # 1. Local port must be free or already ours. Refusing beats fighting:
+  #    another listener means another bridge or a misconfigured port.
+  local who; who="$(listener_of "$PORT")"
+  if [ -n "$who" ] && ! fwd_running; then
+    echo "FAIL 127.0.0.1:$PORT is already taken by [$who] and it is not wsl-cdp-forward." >&2
+    echo "     Another tool owns this port. Pick a free pair, e.g.:" >&2
+    echo "     WSL_CDP_PORT=9225 WSL_CDP_PROXY_PORT=9226 wsl-cdp setup-windows && wsl-cdp up" >&2
+    return 1
+  fi
+  # 2. Windows plumbing present?
+  if [ -z "$(portproxy_rule)" ]; then
+    echo "FAIL no netsh portproxy rule for port $PROXY_PORT on the Windows side." >&2
+    echo "     One-time fix (elevated, UAC): wsl-cdp setup-windows" >&2
+    return 1
+  fi
+  # 3. Browser reachable through the portproxy? If not, launch it and wait.
+  if ! winside >/dev/null; then
+    [ -n "$BROWSER_EXE" ] && [ -x "$BROWSER_EXE" ] || { echo "FAIL no Brave/Chrome/Edge found (set WSL_CDP_BROWSER=/mnt/c/.../browser.exe)" >&2; return 1; }
+    echo "launching $(basename "$BROWSER_EXE") (agent profile $WIN_PROFILE)..."
+    launch_browser
+    local i=0
+    until winside >/dev/null || [ $i -ge 20 ]; do sleep 1; i=$((i+1)); done
+    if ! winside >/dev/null; then
+      echo "FAIL browser launched but http://$(win_ip):$PROXY_PORT/json/version is unreachable." >&2
+      echo "     Likely the inbound firewall rule is missing/stale: rerun wsl-cdp setup-windows," >&2
+      echo "     then wsl-cdp doctor for the full chain breakdown." >&2
+      return 1
+    fi
+  fi
+  # 4. Forwarder: start, or restart if it targets a stale WIN_IP (reboots change it).
+  if fwd_running && ! e2e >/dev/null; then
+    pkill -f "wsl-cdp-forward.py.*--listen-port $PORT" 2>/dev/null
+    sleep 0.3
+  fi
+  fwd_running || start_forwarder
+  # 5. Prove the whole chain.
+  local v; v="$(e2e)" || { echo "FAIL forwarder up but end-to-end check failed; run wsl-cdp doctor" >&2; return 1; }
+  echo "bridge up: $(printf '%s' "$v" | jq -r .Browser) at http://127.0.0.1:$PORT"
+}
+
+cmd_down() {
+  if fwd_running; then
+    pkill -f "wsl-cdp-forward.py.*--listen-port $PORT" && echo "forwarder stopped"
+  else
+    echo "forwarder was not running"
+  fi
+  echo "(browser window left open — close it in Windows, or leave it for next time)"
+}
+
+# status: one line per chain link, first broken link sets exit code. Honesty
+# rule: the forwarder's own listener being up must never mask a dead Windows
+# side, so the Windows side is probed directly.
+cmd_status() {
+  local rc=0 wip; wip="$(win_ip)"
+  if fwd_running; then echo "ok   forwarder      127.0.0.1:$PORT -> $wip:$PROXY_PORT"; else echo "FAIL forwarder      not running (wsl-cdp up)"; rc=1; fi
+  if winside >/dev/null; then echo "ok   windows-side   http://$wip:$PROXY_PORT (portproxy -> browser)"; else echo "FAIL windows-side   http://$wip:$PROXY_PORT unreachable (browser down? setup-windows not run? firewall?)"; [ $rc -eq 0 ] && rc=2; fi
+  local v
+  if v="$(e2e)"; then echo "ok   end-to-end     $(printf '%s' "$v" | jq -r .Browser)"; else echo "FAIL end-to-end     http://127.0.0.1:$PORT/json/version"; [ $rc -eq 0 ] && rc=3; fi
+  return $rc
+}
+
+cmd_doctor() {
+  echo "== wsl-cdp doctor =="
+  echo "ports: browser/wsl-listen=$PORT windows-portproxy=$PROXY_PORT"
+  echo "windows-user: $WINUSER (override: WSL_CDP_WINUSER)"
+  echo "networking-mode: $(wslinfo --networking-mode 2>/dev/null || echo unknown) (this bridge assumes NAT; under mirrored you may not need the portproxy)"
+  if [ -n "$BROWSER_EXE" ] && [ -x "$BROWSER_EXE" ]; then echo "ok   browser        $BROWSER_EXE"; else echo "FAIL browser        none of Brave/Chrome/Edge found (set WSL_CDP_BROWSER)"; fi
+  local nv; nv="$(node --version 2>/dev/null | tr -dc '0-9.' | cut -d. -f1)"
+  [ "${nv:-0}" -ge 22 ] && echo "ok   node           $(node --version) (>=22 needed for eval/screenshot verbs)" || echo "WARN node           ${nv:-none} <22: eval/text/screenshot verbs unavailable"
+  local rule; rule="$(portproxy_rule)"
+  if [ -n "$rule" ]; then echo "ok   portproxy      $rule"; else echo "FAIL portproxy      no v4tov4 rule for $PROXY_PORT — run: wsl-cdp setup-windows"; fi
+  # Stale-rule detection: ANY portproxy rule listening on the browser's own port
+  # can grab 127.0.0.1:$PORT before the browser binds it, pushing it to [::1].
+  local stale; stale="$(netsh.exe interface portproxy show v4tov4 2>/dev/null | tr -d '\r' | awk -v p="$PORT" '$2 == p {print}')"
+  [ -n "$stale" ] && echo "WARN stale rule     a portproxy rule listens on the browser's port $PORT — this races the browser's own bind; delete it (setup-windows does): $stale"
+  cmd_status
+  local rc=$?
+  if [ $rc -ne 0 ]; then
+    echo "-- remediation order: setup-windows (once, elevated) -> wsl-cdp up -> doctor"
+  else
+    echo "-- chain healthy. Agent surface: wsl-cdp tabs|open|eval|text|screenshot, or mcp-add for chrome-devtools-mcp."
+  fi
+  return $rc
+}
+
+cmd_setup_windows() {
+  mkdir -p "$WINHOME/.wsl-cdp"
+  cp "$HERE/wsl-cdp-setup.ps1" "$WINHOME/.wsl-cdp/wsl-cdp-setup.ps1"
+  echo "Triggering elevated Windows setup (UAC prompt on the Windows side)..."
+  powershell.exe -NoProfile -Command \
+    "Start-Process powershell -Verb RunAs -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','$WIN_DOT\\wsl-cdp-setup.ps1','-ProxyPort','$PROXY_PORT','-BrowserPort','$PORT'" \
+    2>/dev/null || true
+  local i=0
+  until [ -n "$(portproxy_rule)" ] || [ $i -ge 24 ]; do sleep 5; i=$((i+1)); done
+  if [ -n "$(portproxy_rule)" ]; then
+    echo "ok   portproxy rule present: $(portproxy_rule)"
+  else
+    echo "Timed out waiting for the rule (UAC not confirmed?). Paste-ready manual path:"
+    echo "  elevated PowerShell> powershell -NoProfile -ExecutionPolicy Bypass -File $WIN_DOT\\wsl-cdp-setup.ps1 -ProxyPort $PROXY_PORT -BrowserPort $PORT"
+    return 1
+  fi
+}
+
+cmd_mcp_add() {
+  # Writes ./.mcp.json (per-repo) — deliberately NOT a global registration:
+  # stdio MCP servers spawn one process per agent session, and most sessions
+  # never browse. Register where deep browser work actually happens.
+  local f="$PWD/.mcp.json" tmp
+  tmp="$(mktemp)"
+  jq -n --slurpfile cur <(cat "$f" 2>/dev/null || echo '{}') '
+    ($cur[0] // {}) as $c
+    | $c * {mcpServers: (($c.mcpServers // {}) + {"chrome-devtools": {
+        command: "npx",
+        args: ["-y", "chrome-devtools-mcp@latest", "--browserUrl", "http://127.0.0.1:'"$PORT"'"]
+      }})}' >"$tmp" && mv "$tmp" "$f"
+  echo "wrote chrome-devtools server to $f (bridge URL http://127.0.0.1:$PORT)"
+  echo "next: restart your agent session in this repo and approve the server when prompted"
+}
+
+need_chain() { e2e >/dev/null || { echo "bridge not up (wsl-cdp up; doctor for detail)" >&2; exit 1; }; }
+
+case "${1:-}" in
+  up)            cmd_up ;;
+  down)          cmd_down ;;
+  status)        cmd_status ;;
+  doctor)        cmd_doctor ;;
+  url)           echo "http://127.0.0.1:$PORT" ;;
+  print-launch)  { printf '%s ' "$BROWSER_EXE"; launch_argv | tr '\n' ' '; echo; } ;;
+  tabs)          need_chain; curl -sf -m 5 "http://127.0.0.1:$PORT/json/list" | jq -r '.[] | select(.type=="page") | [.id, .url] | @tsv' ;;
+  open)          need_chain; u="$(jq -rn --arg u "${2:?usage: wsl-cdp open URL}" '$u|@uri')"
+                 curl -sf -m 10 -X PUT "http://127.0.0.1:$PORT/json/new?$u" | jq -r '[.id, .url] | @tsv' ;;
+  close)         need_chain; curl -sf -m 5 "http://127.0.0.1:$PORT/json/close/${2:?usage: wsl-cdp close TAB_ID}" ;;
+  eval)          need_chain; WSL_CDP_PORT="$PORT" node "$DRIVE" eval "${2:?usage: wsl-cdp eval JS [TAB_ID]}" "${3:-}" ;;
+  text)          need_chain; WSL_CDP_PORT="$PORT" node "$DRIVE" text "${2:-}" ;;
+  screenshot)    need_chain; WSL_CDP_PORT="$PORT" node "$DRIVE" screenshot "${2:-/tmp/wsl-cdp-$$.png}" "${3:-}" ;;
+  setup-windows) cmd_setup_windows ;;
+  mcp-add)       cmd_mcp_add ;;
+  *)             cat >&2 <<'EOF'
+usage: wsl-cdp <command>
+  up | down | status | doctor | url          bridge lifecycle + health
+  tabs | open URL | close ID                 tab management (HTTP CDP)
+  eval JS [TAB] | text [TAB]                 page access (needs node >=22)
+  screenshot [FILE] [TAB]
+  print-launch                               show the exact browser command line
+  setup-windows                              one-time elevated Windows half (UAC)
+  mcp-add                                    per-repo chrome-devtools-mcp entry
+EOF
+                 exit 2 ;;
+esac

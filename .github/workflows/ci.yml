@@ -1,0 +1,25 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  static:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: shellcheck -S warning wsl-cdp install.sh
+      - name: bash syntax
+        run: bash -n wsl-cdp && bash -n install.sh
+      - name: python syntax
+        run: python3 -m py_compile wsl-cdp-forward.py
+      - name: node syntax
+        run: node --check wsl-cdp-drive.mjs
+      - name: powershell syntax
+        shell: pwsh
+        run: |
+          $errs = $null
+          [System.Management.Automation.Language.Parser]::ParseFile("$PWD/wsl-cdp-setup.ps1", [ref]$null, [ref]$errs) | Out-Null
+          if ($errs.Count -gt 0) { $errs; exit 1 }
