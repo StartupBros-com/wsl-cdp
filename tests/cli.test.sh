@@ -224,6 +224,38 @@ h_out="$(harden_run)"
 case "$h_out" in *scrubbed*) _no "harden scrub-noticed an empty store" ;; *) _ok "empty password store: no scrub notice" ;; esac
 if [ -f "$pdefault/Login Data" ]; then _ok "empty store left in place"; else _no "empty store was deleted"; fi
 
+# --- harden failure honesty: a broken Preferences write must NOT report success
+printf 'not json{' >"$prefs"
+h_out="$(harden_run)"; h_rc=$?
+assert_eq "harden with corrupt Preferences -> 1" 1 "$h_rc"
+case "$h_out" in *hardened:*) _no "harden claimed success over a failed prefs write" ;; *) _ok "harden withholds success on a failed prefs write" ;; esac
+
+# a mangled-but-valid file with .signin as a non-object is coerced, not fatal
+printf '{"signin": true}' >"$prefs"
+h_out="$(harden_run)"; h_rc=$?
+assert_eq "harden coerces a non-object .signin -> 0" 0 "$h_rc"
+if jq -e '.signin.allowed_on_next_startup==false' "$prefs" >/dev/null 2>&1; then
+  _ok "non-object .signin coerced and pref set"
+else
+  _no "signin coercion failed: $(cat "$prefs" 2>/dev/null)"
+fi
+
+# mixed counts: readable store + unreadable store — count is qualified, not silently low
+rm -f "$pdefault/Login Data"
+python3 - "$pdefault/Login Data" <<'PY'
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+c.execute("create table logins (origin_url text, username_value text, password_value blob)")
+c.execute("insert into logins values ('https://github.com','will',x'00')")
+c.execute("insert into logins values ('https://example.com','will',x'00')")
+c.commit(); c.close()
+PY
+printf 'garbage-not-sqlite' >"$pdefault/Login Data For Account"
+h_out="$(harden_run)"
+assert_contains "mixed scrub reports the known count" "$h_out" "scrubbed 2 saved password"
+assert_contains "mixed scrub qualifies the unreadable store" "$h_out" "count was unreadable"
+if [ -f "$pdefault/Login Data For Account" ]; then _no "unreadable store survived"; else _ok "unreadable store removed too"; fi
+
 # --- up over an already-live bridge with WSL_CDP_BROWSER set: the explicit
 #     choice must not be DISCARDED silently (v0.3.2 review blocker). Fake
 #     /json/version server on a scratch port makes up return at step 0 —
@@ -251,6 +283,19 @@ up_err="$(WSL_CDP_PORT=$srv_port WSL_CDP_PROXY_PORT=9346 \
   WSL_CDP_BROWSER=/mnt/c/fake/browser.exe "$CLI" up 2>&1 >/dev/null)"
 up_rc=$?
 up_out="$(WSL_CDP_PORT=$srv_port WSL_CDP_PROXY_PORT=9346 "$CLI" up 2>/dev/null)"
+# no-launch path + saved passwords present: up must flag pending hygiene
+rm -f "$pdefault/Login Data"
+python3 - "$pdefault/Login Data" <<'PY'
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+c.execute("create table logins (origin_url text, username_value text, password_value blob)")
+c.execute("insert into logins values ('https://github.com','will',x'00')")
+c.commit(); c.close()
+PY
+up_hyg="$(WSL_CDP_PORT=$srv_port WSL_CDP_PROXY_PORT=9346 \
+  WSL_CDP_USERS_ROOT="$fx4/users" WSL_CDP_WINUSER=testuser \
+  HOME="$fx4/home" "$CLI" up 2>&1 >/dev/null)"
+assert_contains "up (no launch) flags pending hygiene" "$up_hyg" "hygiene applies at launch"
 kill "$srv_pid" 2>/dev/null
 assert_eq "up over a live bridge exits 0" 0 "$up_rc"
 assert_contains "up warns when the browser override is not applied" "$up_err" "WSL_CDP_BROWSER is set"
