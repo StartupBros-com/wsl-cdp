@@ -1,6 +1,12 @@
 # wsl-cdp
 
+[![CI](https://github.com/StartupBros-com/wsl-cdp/actions/workflows/ci.yml/badge.svg)](https://github.com/StartupBros-com/wsl-cdp/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/StartupBros-com/wsl-cdp)](https://github.com/StartupBros-com/wsl-cdp/releases)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 Let AI agents (Claude Code, Codex, cron jobs, plain scripts) running **inside WSL2** drive your **real, logged-in Windows browser** (Chrome, Edge, or Brave) over the Chrome DevTools Protocol.
+
+The agent browser is a **dedicated, hardened profile**: you choose the browser explicitly at setup, the profile stays bound to that vendor, and it keeps sessions — never passwords (the save-password bubble and browser sign-in are disabled per-profile; anything saved anyway is scrubbed at the next launch). Version history: [CHANGELOG](CHANGELOG.md).
 
 ```
 WSL 127.0.0.1:9223 ──(local relay)──► WIN_IP:9224 ──(netsh portproxy)──► 127.0.0.1:9223 browser
@@ -48,7 +54,7 @@ Each of these is a silent failure if you wire the bridge by hand:
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/StartupBros-com/wsl-cdp/main/install.sh | bash
+curl -fsSL "https://raw.githubusercontent.com/StartupBros-com/wsl-cdp/main/install.sh?$(date +%s)" | bash
 ```
 
 Or clone and symlink `wsl-cdp` onto your PATH; the scripts resolve their siblings via their own location. Claude Code users can instead install the plugin (skill + guided `/wsl-cdp:setup`) from the [House of Vibe marketplace](https://github.com/StartupBros-com/hov-marketplace): `/plugin marketplace add StartupBros-com/hov-marketplace`, then `/plugin install wsl-cdp@hov`. Requirements: WSL2 (NAT networking), `jq`, `python3` (stdlib only), node ≥ 22 for the `eval`/`text`/`screenshot` verbs (built-in WebSocket; no npm installs).
@@ -75,14 +81,14 @@ Environment: `WSL_CDP_PORT` (9223) · `WSL_CDP_PROXY_PORT` (9224) · `WSL_CDP_WI
 
 ## How it compares
 
-Several tools touch this space. None has this shape:
+Several tools touch this space. None has this shape — and none of them manages the agent profile at all, let alone enforces its hygiene (dedicated vendor-bound profile, no saved passwords, no browser sign-in, automatic scrub):
 
 | Tool | What it is | vs wsl-cdp |
 |---|---|---|
 | [chrome-devtools-mcp](https://github.com/ChromeDevTools/chrome-devtools-mcp) | Google's official MCP server; generic `--browserUrl` attach | The best *driver* once a bridge exists, but it does not build the WSL2 bridge. Use both: `wsl-cdp mcp-add` wires it to this bridge. |
 | [chrome-cdp-skill](https://github.com/pasky/chrome-cdp-skill) | Popular CDP verb CLI | Same-host only; no WSL awareness at all. If your agent and browser share an OS, use that. |
 | [browser-ipc-cdp](https://github.com/alexis14kl/browser-ipc-cdp) | MCP server that automates the WSL portproxy/firewall | Real engineering (its dynamic-port design is clever; credit where due), but MCP-only distribution, no operator CLI, no doctor. |
-| Claude in Chrome extension | Native-messaging pairing with your real profile | Structurally unavailable from WSL2; Chrome/Claude-only even where it works. |
+| Claude in Chrome extension | Native-messaging pairing with **your real profile** | Structurally unavailable from WSL2; Chrome/Claude-only even where it works — and it rides your primary profile, where wsl-cdp insists on a separate, hardened one. |
 | Recipe blogs / setup-script repos | The same chain, hand-rolled | Where this knowledge lived before; no health model, no idempotency, no stale-rule handling. |
 
 ## Limitations (read before relying on it)
