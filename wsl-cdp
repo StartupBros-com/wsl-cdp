@@ -125,9 +125,9 @@ profile_browser() {
 }
 
 saved_password_count() { # saved_password_count FILE -> count on stdout, empty if uncountable
-  # Queries a COPY of the store: Chrome may hold it locked, and WAL sidecars
-  # can shadow rows. python3 stdlib sqlite3 — already a hard dependency of the
-  # forwarder/setup — avoids requiring sqlite3(1). A missing file counts as 0.
+  # Queries a COPY of the store: Chrome may hold it locked through 9p. python3
+  # stdlib sqlite3 — already a hard dependency of the forwarder/setup — avoids
+  # requiring sqlite3(1). A missing file counts as 0.
   [ -f "$1" ] || { printf '0'; return; }
   python3 - "$1" 2>/dev/null <<'PY'
 import os, shutil, sqlite3, sys, tempfile
@@ -151,7 +151,10 @@ scrub_passwords() {
     [ -f "$f" ] || continue
     n="$(saved_password_count "$f")"
     [ "$n" = "0" ] && continue
-    rm -f "$f" "$f-journal" "$f-wal" "$f-shm" 2>/dev/null
+    # Sidecar is "<name>-journal" only: LoginDatabase runs journal_mode=
+    # TRUNCATE, never WAL, so no -wal/-shm exist for these files (verified in
+    # chromium sql/database.cc + password_manager_constants.cc).
+    rm -f "$f" "$f-journal" 2>/dev/null
     if [ -f "$f" ]; then
       echo "WARN could not remove the saved-password store $f (browser running?)" >&2
       continue
