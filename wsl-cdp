@@ -165,8 +165,9 @@ cmd_up() {
     echo "     WSL_CDP_PORT=9225 WSL_CDP_PROXY_PORT=9226 wsl-cdp setup-windows && wsl-cdp up" >&2
     return 1
   fi
-  # 2. Windows plumbing present?
-  if [ -z "$(portproxy_rule)" ]; then
+  # 2. Windows plumbing present? A passing TCP probe outranks netsh (which can
+  #    be interop-down while the rule works fine).
+  if [ -z "$(portproxy_rule)" ] && ! winside >/dev/null; then
     echo "FAIL no netsh portproxy rule for port $PROXY_PORT on the Windows side." >&2
     echo "     One-time fix (elevated, UAC): wsl-cdp setup-windows" >&2
     return 1
@@ -210,11 +211,22 @@ cmd_down() {
 # rule: the forwarder's own listener being up must never mask a dead Windows
 # side, so the Windows side is probed directly.
 cmd_status() {
+  # TCP probes are ground truth; process identity and netsh output are detail
+  # views. A working chain served by a sibling relay (or by mirrored-mode
+  # loopback, which needs no relay at all) is a HEALTHY chain.
   local rc=0 wip; wip="$(win_ip)"
-  if fwd_running; then echo "ok   forwarder      127.0.0.1:$PORT -> $wip:$PROXY_PORT"; else echo "FAIL forwarder      not running (wsl-cdp up)"; rc=1; fi
+  local v who; v="$(e2e)" || v=""; who="$(listener_of "$PORT")"
+  if fwd_running; then
+    echo "ok   forwarder      127.0.0.1:$PORT -> $wip:$PROXY_PORT"
+  elif [ -n "$v" ] && [ -n "$who" ]; then
+    echo "ok   forwarder      external relay serves 127.0.0.1:$PORT [$who] — not wsl-cdp's own, which is fine"
+  elif [ -n "$v" ]; then
+    echo "ok   forwarder      not needed: 127.0.0.1:$PORT reachable with no local relay (mirrored networking?)"
+  else
+    echo "FAIL forwarder      not running (wsl-cdp up)"; rc=1
+  fi
   if winside >/dev/null; then echo "ok   windows-side   http://$wip:$PROXY_PORT (portproxy -> browser)"; else echo "FAIL windows-side   http://$wip:$PROXY_PORT unreachable (browser down? setup-windows not run? firewall?)"; [ $rc -eq 0 ] && rc=2; fi
-  local v
-  if v="$(e2e)"; then echo "ok   end-to-end     $(printf '%s' "$v" | jq -r .Browser)"; else echo "FAIL end-to-end     http://127.0.0.1:$PORT/json/version"; [ $rc -eq 0 ] && rc=3; fi
+  if [ -n "$v" ]; then echo "ok   end-to-end     $(printf '%s' "$v" | jq -r .Browser)"; else echo "FAIL end-to-end     http://127.0.0.1:$PORT/json/version"; [ $rc -eq 0 ] && rc=3; fi
   return $rc
 }
 
@@ -234,7 +246,15 @@ cmd_doctor() {
   local nv; nv="$(node --version 2>/dev/null | tr -dc '0-9.' | cut -d. -f1)"
   [ "${nv:-0}" -ge 22 ] && echo "ok   node           $(node --version) (>=22 needed for eval/screenshot verbs)" || echo "WARN node           ${nv:-none} <22: eval/text/screenshot verbs unavailable"
   local rule; rule="$(portproxy_rule)"
-  if [ -n "$rule" ]; then echo "ok   portproxy      $rule"; else echo "FAIL portproxy      no v4tov4 rule for $PROXY_PORT — run: wsl-cdp setup-windows"; fi
+  if [ -n "$rule" ]; then
+    echo "ok   portproxy      $rule"
+  elif winside >/dev/null; then
+    # netsh rides WSL interop and can be down while the rule works fine; the
+    # TCP probe through the rule is the proof that matters (issue #4).
+    echo "ok   portproxy      netsh unverifiable (interop down) — proven working by the windows-side probe"
+  else
+    echo "FAIL portproxy      no v4tov4 rule for $PROXY_PORT — run: wsl-cdp setup-windows"
+  fi
   # Stale-rule detection: ANY portproxy rule listening on the browser's own port
   # can grab 127.0.0.1:$PORT before the browser binds it, pushing it to [::1].
   local stale; stale="$(netsh.exe interface portproxy show v4tov4 2>/dev/null | tr -d '\r' | awk -v p="$PORT" '$2 == p {print}')"
