@@ -124,6 +124,81 @@ profile_browser() {
   return 0
 }
 
+saved_password_count() { # saved_password_count FILE -> count on stdout, empty if uncountable
+  # Queries a COPY of the store: Chrome may hold it locked, and WAL sidecars
+  # can shadow rows. python3 stdlib sqlite3 — already a hard dependency of the
+  # forwarder/setup — avoids requiring sqlite3(1). A missing file counts as 0.
+  [ -f "$1" ] || { printf '0'; return; }
+  python3 - "$1" 2>/dev/null <<'PY'
+import os, shutil, sqlite3, sys, tempfile
+fd, tmp = tempfile.mkstemp()
+os.close(fd)
+try:
+    shutil.copy(sys.argv[1], tmp)
+    print(sqlite3.connect(tmp).execute("select count(*) from logins").fetchone()[0])
+finally:
+    os.unlink(tmp)
+PY
+}
+
+scrub_passwords() {
+  # Saved website passwords live in their own SQLite stores, fully separate
+  # from Cookies (sessions) — removing them logs nothing out. Callers ensure
+  # the browser is closed (up's launch path, or the harden verb's guard).
+  # The store FILE reappearing later is normal: Chrome recreates it empty.
+  local pdir="$WINHOME/.wsl-cdp/profile/Default" f n scrubbed=0 total=0 unknown=0
+  for f in "$pdir/Login Data" "$pdir/Login Data For Account"; do
+    [ -f "$f" ] || continue
+    n="$(saved_password_count "$f")"
+    [ "$n" = "0" ] && continue
+    rm -f "$f" "$f-journal" "$f-wal" "$f-shm" 2>/dev/null
+    if [ -f "$f" ]; then
+      echo "WARN could not remove the saved-password store $f (browser running?)" >&2
+      continue
+    fi
+    scrubbed=1
+    if [ -n "$n" ]; then total=$((total+n)); else unknown=1; fi
+  done
+  if [ "$scrubbed" = 1 ]; then
+    if [ "$unknown" = 1 ] && [ "$total" -eq 0 ]; then
+      echo "scrubbed the agent profile's saved-password store (count unreadable) — the profile keeps sessions, never passwords; use your real password manager."
+    else
+      echo "scrubbed $total saved password(s) from the agent profile — it keeps sessions (cookies), never passwords; use your real password manager."
+    fi
+  fi
+  return 0
+}
+
+harden_profile() {
+  # The agent profile must never accumulate credentials or browser identity:
+  # anything that can reach the debug port can read this profile. Enforced,
+  # not advised — the dangerous UI never renders:
+  #   credentials_enable_service=false     no offer-to-save-passwords bubble
+  #     (the pref behind the PasswordManagerEnabled enterprise policy)
+  #   credentials_enable_autosignin=false  no credential auto-signin
+  #   signin.allowed_on_next_startup=false no "sign in to Chrome" surface
+  # Written into the profile's own Preferences JSON, NEVER as Windows policy
+  # registry keys — those are machine/user-wide and would narrow the
+  # operator's DAILY browser too. Chromium honors a pre-seeded Preferences
+  # file in a fresh --user-data-dir and unknown keys are inert on Edge/Brave.
+  # Callers ensure the browser is closed, or Chrome rewrites prefs on exit.
+  local pdir="$WINHOME/.wsl-cdp/profile/Default" pf tmp
+  pf="$pdir/Preferences"
+  mkdir -p "$pdir" 2>/dev/null || { echo "WARN cannot reach the agent profile dir to harden it ($pdir)" >&2; return 0; }
+  tmp="$pf.tmp.$$"
+  if jq -n --slurpfile cur <(cat "$pf" 2>/dev/null || echo '{}') '
+       ($cur[0] // {})
+       | .credentials_enable_service = false
+       | .credentials_enable_autosignin = false
+       | .signin.allowed_on_next_startup = false' >"$tmp" 2>/dev/null && mv "$tmp" "$pf"; then
+    :
+  else
+    rm -f "$tmp"
+    echo "WARN could not write hygiene prefs into $pf (this launch runs unhardened)" >&2
+  fi
+  scrub_passwords
+}
+
 running_of() { # running_of IMAGENAME (e.g. brave.exe) -> true|false|null; memoized
   # tasklist.exe rides WSL interop: when it is down (or absent, as in CI) the
   # honest answer is null/unknown, never false. Memoized per image name because
@@ -255,6 +330,7 @@ launch_argv() {
     "--remote-allow-origins=*" \
     "--no-first-run" \
     "--no-default-browser-check" \
+    "--disable-sync" \
     "--disable-background-networking" \
     "--component-update-interval-in-sec=31536000" \
     "--check-for-update-interval=31536000"
@@ -345,6 +421,7 @@ cmd_up() {
     resolve_win || return 1
     [ -n "$BROWSER_EXE" ] && [ -x "$BROWSER_EXE" ] || { echo "FAIL no Chrome/Edge/Brave found (set WSL_CDP_BROWSER=/mnt/c/.../browser.exe)" >&2; return 1; }
     echo "launching $(basename "$BROWSER_EXE") (agent profile $WIN_PROFILE)..."
+    harden_profile
     launch_browser
     launched=1
     local i=0
@@ -440,20 +517,28 @@ cmd_status() {
 
 cmd_doctor_json() {
   resolve_win 2>/dev/null || true
-  local nv browser jqok rule netmode status_json rc
+  local nv browser jqok rule netmode status_json rc pc1 pc2 pwjson=null
   nv="$(node --version 2>/dev/null || echo none)"
   browser="none"; [ -n "${BROWSER_EXE:-}" ] && [ -x "${BROWSER_EXE:-}" ] && browser="$BROWSER_EXE"
   jqok=false; command -v jq >/dev/null 2>&1 && jqok=true
   rule="$(portproxy_rule)"
   netmode="$(wslinfo --networking-mode 2>/dev/null || echo unknown)"
+  # saved_passwords: number, or null when unknown (no winuser / store locked)
+  if [ -n "${WINHOME:-}" ]; then
+    pc1="$(saved_password_count "$WINHOME/.wsl-cdp/profile/Default/Login Data")"
+    pc2="$(saved_password_count "$WINHOME/.wsl-cdp/profile/Default/Login Data For Account")"
+    [ -n "$pc1" ] && [ -n "$pc2" ] && pwjson=$((pc1+pc2))
+  fi
   status_json="$(cmd_status)"; rc=$?
   jq -n --argjson st "$status_json" \
         --arg winuser "${WINUSER:-}" --arg browser "$browser" \
         --arg node "$nv" --argjson jq "$jqok" --arg portproxy "${rule:-}" \
         --arg netmode "$netmode" --argjson bport "$PORT" --argjson pport "$PROXY_PORT" \
+        --argjson pw "$pwjson" \
         '$st + {env: {winuser: $winuser, browser: $browser, node: $node, jq: $jq,
                       portproxy: $portproxy, networking: $netmode,
-                      ports: {browser: $bport, portproxy: $pport}}}'
+                      ports: {browser: $bport, portproxy: $pport},
+                      profile: {saved_passwords: $pw}}}'
   return $rc
 }
 
@@ -470,6 +555,18 @@ cmd_doctor() {
   echo "networking-mode: $(wslinfo --networking-mode 2>/dev/null || echo unknown) (this bridge assumes NAT; under mirrored you may not need the portproxy)"
   if [ -n "$WINUSER" ]; then
     if [ -n "$BROWSER_EXE" ] && [ -x "$BROWSER_EXE" ]; then echo "ok   browser        $BROWSER_EXE"; else echo "FAIL browser        none of Chrome/Edge/Brave found (set WSL_CDP_BROWSER)"; fi
+    # Hygiene: the store FILE existing is normal (Chrome recreates it empty);
+    # only a row count > 0 — or an uncountable store — is worth a WARN.
+    local pc1 pc2
+    pc1="$(saved_password_count "$WINHOME/.wsl-cdp/profile/Default/Login Data")"
+    pc2="$(saved_password_count "$WINHOME/.wsl-cdp/profile/Default/Login Data For Account")"
+    if [ -z "$pc1" ] || [ -z "$pc2" ]; then
+      echo "WARN profile-hygiene saved-password store uncountable (browser holding it?) — run 'wsl-cdp harden' with the agent browser closed"
+    elif [ $((pc1+pc2)) -gt 0 ]; then
+      echo "WARN profile-hygiene $((pc1+pc2)) saved password(s) in the agent profile — the next 'wsl-cdp up' launch (or 'wsl-cdp harden') scrubs them; sessions are unaffected"
+    else
+      echo "ok   profile-hygiene no saved passwords in the agent profile"
+    fi
   fi
   local nv; nv="$(node --version 2>/dev/null | tr -dc '0-9.' | cut -d. -f1)"
   [ "${nv:-0}" -ge 22 ] && echo "ok   node           $(node --version) (>=22 needed for eval/screenshot verbs)" || echo "WARN node           ${nv:-none} <22: eval/text/screenshot verbs unavailable"
@@ -591,6 +688,9 @@ usage: wsl-cdp <command>
   screenshot [FILE] [TAB]
   browsers [--json]                          installed browsers in autodetect rank
                                              order + recommended/running/recorded
+  harden                                     scrub saved passwords + disable the
+                                             password-save/sign-in UI (also auto-
+                                             runs at every up launch)
   print-launch                               show the exact browser command line
   setup-windows                              one-time elevated Windows half (UAC)
   mcp-add                                    per-repo chrome-devtools-mcp entry
@@ -629,6 +729,16 @@ case "$cmd" in
   doctor)        cmd_doctor ;;
   url)           no_args "$@"; echo "http://127.0.0.1:$PORT" ;;
   browsers)      cmd_browsers ;;
+  harden)        no_args "$@"
+                 # Refuse over a live agent browser: Chrome rewrites Preferences
+                 # on exit (undoing the seed) and holds the password stores.
+                 if e2e >/dev/null 2>&1 || winside >/dev/null 2>&1; then
+                   echo "wsl-cdp: the agent browser looks up — wsl-cdp down, close the agent window on Windows, then rerun harden (a live profile would undo it on exit)" >&2
+                   exit 1
+                 fi
+                 resolve_win || exit 1
+                 harden_profile
+                 echo "hardened: password saving + browser sign-in disabled for the agent profile (sessions untouched); auto-applied at every 'up' launch" ;;
   print-launch)  no_args "$@"; resolve_win || exit 1
                  { printf '%s ' "$BROWSER_EXE"; launch_argv | tr '\n' ' '; echo; } ;;
   tabs)          need_chain

@@ -48,6 +48,7 @@ assert_contains "print-launch pairs the dedicated profile" "$argv" 'user-data-di
 
 # --- launch argv suppresses in-process updater/background churn (v0.3.1:
 #     a fresh agent profile must not kick off update churn; Brave relaunch loop)
+assert_contains "argv disables browser sync" "$argv" "--disable-sync"
 assert_contains "argv disables background networking" "$argv" "--disable-background-networking"
 assert_contains "argv stretches the component-update interval" "$argv" "--component-update-interval-in-sec="
 assert_contains "argv stretches the staged-update poll" "$argv" "--check-for-update-interval="
@@ -163,6 +164,65 @@ mkdir -p "$fx3/users/testuser/AppData/Local/Temp" "$fx3/home"
 assert_exit "browsers with no installs -> 1" 1 env WSL_CDP_USERS_ROOT="$fx3/users" \
   WSL_CDP_WINUSER=testuser WSL_CDP_PROGRAMFILES="$fx3/pf" \
   WSL_CDP_PROGRAMFILES_X86="$fx3/pf86" HOME="$fx3/home" "$CLI" browsers
+
+# --- harden / profile hygiene (v0.3.3): pref seeding, merge-not-clobber,
+#     password scrub that spares sessions, empty-store no-op
+fx4="$(make_fixture)"
+harden_run(){ WSL_CDP_USERS_ROOT="$fx4/users" WSL_CDP_WINUSER=testuser \
+  WSL_CDP_PROGRAMFILES="$fx4/pf" WSL_CDP_PROGRAMFILES_X86="$fx4/pf86" \
+  HOME="$fx4/home" "$CLI" harden 2>/dev/null; }
+prefs="$fx4/users/testuser/.wsl-cdp/profile/Default/Preferences"
+pdefault="$fx4/users/testuser/.wsl-cdp/profile/Default"
+
+assert_exit "harden extra arg -> 2" 2 "$CLI" harden extra
+
+h_out="$(harden_run)"; h_rc=$?
+assert_eq "harden exits 0" 0 "$h_rc"
+assert_contains "harden reports what it did" "$h_out" "hardened"
+if jq -e '.credentials_enable_service==false and .credentials_enable_autosignin==false
+          and .signin.allowed_on_next_startup==false' "$prefs" >/dev/null 2>&1; then
+  _ok "harden seeds the hygiene prefs"
+else
+  _no "harden prefs wrong: $(cat "$prefs" 2>/dev/null)"
+fi
+
+python3 - "$prefs" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+d["homepage"] = "https://example.com"
+json.dump(d, open(sys.argv[1], "w"))
+PY
+harden_run >/dev/null
+if jq -e '.homepage=="https://example.com" and .credentials_enable_service==false' "$prefs" >/dev/null 2>&1; then
+  _ok "harden merges into existing Preferences (no clobber)"
+else
+  _no "harden clobbered Preferences: $(cat "$prefs" 2>/dev/null)"
+fi
+
+python3 - "$pdefault/Login Data" <<'PY'
+import os, sqlite3, sys
+os.makedirs(os.path.dirname(sys.argv[1]), exist_ok=True)
+c = sqlite3.connect(sys.argv[1])
+c.execute("create table logins (origin_url text, username_value text, password_value blob)")
+c.execute("insert into logins values ('https://github.com','will',x'00')")
+c.execute("insert into logins values ('https://example.com','will',x'00')")
+c.commit(); c.close()
+PY
+touch "$pdefault/Cookies"
+h_out="$(harden_run)"
+assert_contains "harden scrubs and counts saved passwords" "$h_out" "scrubbed 2 saved password"
+if [ -f "$pdefault/Login Data" ]; then _no "Login Data survived the scrub"; else _ok "Login Data removed by the scrub"; fi
+if [ -f "$pdefault/Cookies" ]; then _ok "Cookies (sessions) untouched by the scrub"; else _no "scrub deleted Cookies"; fi
+
+python3 - "$pdefault/Login Data" <<'PY'
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+c.execute("create table logins (origin_url text, username_value text, password_value blob)")
+c.commit(); c.close()
+PY
+h_out="$(harden_run)"
+case "$h_out" in *scrubbed*) _no "harden scrub-noticed an empty store" ;; *) _ok "empty password store: no scrub notice" ;; esac
+if [ -f "$pdefault/Login Data" ]; then _ok "empty store left in place"; else _no "empty store was deleted"; fi
 
 # --- up over an already-live bridge with WSL_CDP_BROWSER set: the explicit
 #     choice must not be DISCARDED silently (v0.3.2 review blocker). Fake
