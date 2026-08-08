@@ -40,6 +40,7 @@ Each of these is a silent failure if you wire the bridge by hand:
 - **`--remote-allow-origins` is required** for cross-host WebSocket handshakes, a separate failure mode that looks like a network problem.
 - **WSL interop is flaky.** `netsh.exe` can transiently return empty output with exit 0; wsl-cdp retries instead of misreading it as "rule missing".
 - **Brave's updater fights a second instance of a shared install.** Brave's `Application\brave.exe` is a version stub; a background scheduled task (`BraveSoftwareUpdateTaskMachineUA`) stages updates into a new versioned directory that can only swap in once **no** `brave.exe` is running. Launch an agent instance while your daily Brave is open and the pending update relaunch-loops the new window — `--user-data-dir` isolates the profile, not the install. wsl-cdp therefore autodetects Chrome/Edge before Brave (a different install can't contend with your daily browser) and passes updater-suppression flags. If you pin Brave via `WSL_CDP_BROWSER` and hit the loop: close **every** Brave window, launch Brave once so the update completes, then `wsl-cdp up`.
+- **Chromium profiles are not portable across vendors**, and the agent profile dir is browser-independent — so `up` records which browser first launched the profile (`%USERPROFILE%\.wsl-cdp\browser`) and keeps using it even if the autodetect order changes in a later release. Your logged-in sessions stay with the browser that created them. To switch vendors deliberately, set `WSL_CDP_BROWSER` (or delete that file) — and expect to log in again. Upgrading from ≤ v0.3.0, where Brave ranked first and nothing was recorded: your first v0.3.1 `up` autodetects fresh, so if you had a logged-in Brave agent profile, pin Brave with `WSL_CDP_BROWSER` before running `up`.
 
 `wsl-cdp doctor` checks every link independently and names the first broken one with its exact remediation. A live relay is never allowed to mask a dead Windows side.
 
@@ -67,7 +68,7 @@ Or clone and symlink `wsl-cdp` onto your PATH; the scripts resolve their sibling
 
 **Exit codes:** `0` ok · `1` chain/forwarder down (or a CDP call failed after the chain proved healthy) · `2` usage error / invalid argument / unknown flag · `3` end-to-end check failed. Unknown flags and stray arguments are rejected loudly rather than ignored, so a wrong guess never returns a false success.
 
-Environment: `WSL_CDP_PORT` (9223) · `WSL_CDP_PROXY_PORT` (9224) · `WSL_CDP_WINUSER` (autodetected) · `WSL_CDP_BROWSER` (autodetected: Chrome → Edge → Brave; Brave last because of the updater contention above) · `WSL_CDP_USERS_ROOT` (`/mnt/c/Users`; override the Windows users root, mainly for tests).
+Environment: `WSL_CDP_PORT` (9223) · `WSL_CDP_PROXY_PORT` (9224) · `WSL_CDP_WINUSER` (autodetected) · `WSL_CDP_BROWSER` (autodetected: Chrome → Edge → Brave, Brave last because of the updater contention above; once a profile has been launched, its recorded browser outranks autodetection) · `WSL_CDP_USERS_ROOT` (`/mnt/c/Users`; override the Windows users root, mainly for tests).
 
 ## How it compares
 

@@ -88,7 +88,8 @@ detect_browser() { # first hit wins: Chrome (system, user), Edge (x86, 64-bit), 
   # only complete when no brave.exe runs — when Brave is also the operator's
   # daily browser, the agent instance relaunch-loops on "update pending"
   # (--user-data-dir isolates the profile, not the shared install). Brave still
-  # works when it is the only browser, or pinned via WSL_CDP_BROWSER.
+  # works when it is the only browser, or pinned via WSL_CDP_BROWSER. Once a
+  # profile has been launched, profile_browser() outranks this order entirely.
   local c
   for c in \
     "$PROGRAMFILES/Google/Chrome/Application/chrome.exe" \
@@ -99,6 +100,22 @@ detect_browser() { # first hit wins: Chrome (system, user), Edge (x86, 64-bit), 
     "$PROGRAMFILES/BraveSoftware/Brave-Browser/Application/brave.exe"; do
     [ -x "$c" ] && { printf '%s' "$c"; return; }
   done
+}
+
+profile_browser() {
+  # Chromium profiles are not portable across vendors, so the browser that
+  # first launched the agent profile must keep owning it: launch_browser()
+  # records the exe next to the profile (Windows side, so it travels with the
+  # profile, not the distro) and this readback outranks detect_browser() from
+  # then on. Without it, any future change in autodetect order would silently
+  # reopen a Brave-built profile with Edge/Chrome and orphan every persisted
+  # login. WSL_CDP_BROWSER still overrides; a stale record (browser
+  # uninstalled) falls through to autodetect instead of blocking.
+  local f="$WINHOME/.wsl-cdp/browser" b
+  [ -f "$f" ] || return 0
+  b="$(cat "$f" 2>/dev/null)"
+  [ -n "$b" ] && [ -x "$b" ] && printf '%s' "$b"
+  return 0
 }
 
 # Resolved lazily: only commands that touch the Windows side of the launch/setup
@@ -123,7 +140,11 @@ resolve_win() {
   # poison the cache for later, un-overridden runs.
   [ "$from_override" = 0 ] && { mkdir -p "$STATE" && printf '%s' "$WINUSER" >"$cache"; }
   WINHOME="$USERS_ROOT/$WINUSER"
-  BROWSER_EXE="${WSL_CDP_BROWSER:-$(detect_browser)}"
+  # Precedence: explicit env override > the browser recorded as owning the
+  # profile > autodetect order.
+  BROWSER_EXE="${WSL_CDP_BROWSER:-}"
+  [ -z "$BROWSER_EXE" ] && BROWSER_EXE="$(profile_browser)"
+  [ -z "$BROWSER_EXE" ] && BROWSER_EXE="$(detect_browser)"
   WIN_DOT="C:\\Users\\$WINUSER\\.wsl-cdp"
   WIN_PROFILE="$WIN_DOT\\profile"
 }
@@ -133,12 +154,20 @@ win_ip() { ip route show default | awk '{print $3; exit}'; }
 launch_argv() {
   # --remote-debugging-port and --user-data-dir are a UNIT: Chromium 136+
   # silently ignores the former without the latter. Do not split them.
-  # The last three suppress updater/background churn on a fresh agent profile.
-  # --disable-brave-update and the component-update interval are Brave switches
-  # (harmless elsewhere: Chromium ignores unknown switches); the generic
-  # --check-for-update-interval is a no-op on modern Chromium. NOTE these can't
-  # finish an update the OS-side updater has already staged — that needs every
-  # instance of that browser closed once (README: Brave update loop).
+  # The last three suppress in-process updater/background churn (v0.3.1), each
+  # verified against Chromium/brave-core source:
+  #   --disable-background-networking  Playwright/Puppeteer-standard; silences
+  #     safe-browsing/translate/variations pings, never page loads or CDP.
+  #   --component-update-interval-in-sec  Brave switch (inert on Chrome/Edge:
+  #     Chromium ignores unknown switches) stretching Brave's in-process
+  #     component-updater cadence to ~1 year.
+  #   --check-for-update-interval  stretches InstalledVersionPoller (default
+  #     2h), the local staged-update poll behind relaunch-to-update nagging.
+  # (--disable-brave-update is deliberately ABSENT: its only consumer is the
+  # macOS Sparkle path — dead weight for a Windows-only tool.) None of these
+  # stop the OS-side updater (Omaha/BraveSoftwareUpdate scheduled tasks run
+  # outside the browser); a staged swap still needs every instance of that
+  # browser closed once (README: Brave update loop).
   printf '%s\n' \
     "--remote-debugging-port=$PORT" \
     "--user-data-dir=$WIN_PROFILE" \
@@ -146,8 +175,8 @@ launch_argv() {
     "--no-first-run" \
     "--no-default-browser-check" \
     "--disable-background-networking" \
-    "--disable-brave-update" \
-    "--component-update-interval-in-sec=31536000"
+    "--component-update-interval-in-sec=31536000" \
+    "--check-for-update-interval=31536000"
 }
 
 listener_of() { # listener_of PORT -> "pid comm" of any local listener, empty if none
@@ -187,6 +216,9 @@ start_forwarder() {
 launch_browser() {
   local args=() a
   while IFS= read -r a; do args+=("$a"); done < <(launch_argv)
+  # Record what actually owns the profile from here on (see profile_browser).
+  # Best-effort: a 9p hiccup must not block the launch itself.
+  mkdir -p "$WINHOME/.wsl-cdp" 2>/dev/null && printf '%s' "$BROWSER_EXE" >"$WINHOME/.wsl-cdp/browser" 2>/dev/null
   "$BROWSER_EXE" "${args[@]}" >/dev/null 2>&1 &
   disown
 }
