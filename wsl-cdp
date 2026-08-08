@@ -53,6 +53,27 @@ PROGRAMFILES_X86="${WSL_CDP_PROGRAMFILES_X86:-/mnt/c/Program Files (x86)}"
 # make `up`/`down` kill the wrong forwarder.
 FWD_PAT="wsl-cdp-forward\.py .*--listen-port ${PORT}([[:space:]]|\$)"
 
+# EVERY Windows-exe invocation goes through win_exec: a wedged interop channel
+# HANGS calls (vsock accept4 failed 110) rather than failing them, so an
+# untimed netsh/cmd call can hang a verb forever — measured 2026-08-08 when
+# setup-windows' rule poll pinned an operator run past 300s. A wedge reads as
+# empty output + rc 124. </dev/null is load-bearing here too: an interop child
+# inheriting a read-loop's stdin drains it (the tasklist enumeration bug).
+# 9p file IO (/mnt/c) is a separate channel and keeps working during outages.
+WIN_EXEC_TIMEOUT="${WSL_CDP_WIN_EXEC_TIMEOUT:-8}"
+win_exec() { timeout "$WIN_EXEC_TIMEOUT" "$@" </dev/null 2>/dev/null; }
+
+interop_ok() { # cheap memoized liveness probe of the WSL->Windows exec channel
+  if [ -z "${_INTEROP_OK:-}" ]; then
+    if [ "$(win_exec cmd.exe /c 'echo ok' | tr -d '\r\n ')" = "ok" ]; then
+      _INTEROP_OK=0
+    else
+      _INTEROP_OK=1
+    fi
+  fi
+  return "$_INTEROP_OK"
+}
+
 detect_winuser() {
   # Interop (cmd.exe/powershell.exe) can transiently die on WSL vsock errors —
   # measured on 2026-08-08 with BOTH launchers returning empty for minutes — so
@@ -65,11 +86,11 @@ detect_winuser() {
   #      measured picking a sandbox profile over the real user.)
   local u d i best="" best_t=0 t
   for i in 1 2; do
-    u="$(cmd.exe /c 'echo %USERNAME%' 2>/dev/null | tr -d '\r\n')"
+    u="$(win_exec cmd.exe /c 'echo %USERNAME%' | tr -d '\r\n')"
     [ -n "$u" ] && [ -d "$USERS_ROOT/$u" ] && { printf '%s' "$u"; return; }
     sleep 1
   done
-  u="$(powershell.exe -NoProfile -Command 'Write-Output $env:USERNAME' 2>/dev/null | tr -d '\r\n')"
+  u="$(win_exec powershell.exe -NoProfile -Command 'Write-Output $env:USERNAME' | tr -d '\r\n')"
   [ -n "$u" ] && [ -d "$USERS_ROOT/$u" ] && { printf '%s' "$u"; return; }
   [ -d "$USERS_ROOT/$USER" ] && { printf '%s' "$USER"; return; }
   for d in "$USERS_ROOT"/*/; do
@@ -231,10 +252,9 @@ running_of() { # running_of IMAGENAME (e.g. brave.exe) -> true|false|null; memoi
   local n="$1" var out v
   var="_RUN_${n%%.*}"
   [ -n "${!var:-}" ] && { printf '%s' "${!var}"; return; }
-  # </dev/null is load-bearing: cmd_browsers calls this inside a `while read`
-  # loop fed by process substitution, and an interop child inheriting that
-  # stdin DRAINS it — measured truncating enumeration to one row.
-  out="$(tasklist.exe /FO CSV /FI "IMAGENAME eq $n" </dev/null 2>/dev/null | tr -d '\r')"
+  # win_exec provides the load-bearing </dev/null (stdin-drain guard for the
+  # read loop in cmd_browsers) AND the hang guard.
+  out="$(win_exec tasklist.exe /FO CSV /FI "IMAGENAME eq $n" | tr -d '\r')"
   if [ -z "$out" ]; then v=null
   elif printf '%s' "$out" | grep -qi "\"$n\""; then v=true
   else v=false; fi
@@ -375,7 +395,7 @@ portproxy_rule() { # prints the portproxy rule line for PROXY_PORT, empty if non
   # missing" — that false negative would block `up` entirely.
   local out i
   for i in 1 2 3; do
-    out="$(netsh.exe interface portproxy show v4tov4 2>/dev/null | tr -d '\r' \
+    out="$(win_exec netsh.exe interface portproxy show v4tov4 | tr -d '\r' \
       | awk -v p="$PROXY_PORT" '$2 == p {print}')"
     [ -n "$out" ] && { printf '%s' "$out"; return 0; }
     [ "$i" -lt 3 ] && sleep 1
@@ -434,8 +454,21 @@ cmd_up() {
     return 1
   fi
   # 2. Windows plumbing present? A passing TCP probe outranks netsh (which can
-  #    be interop-down while the rule works fine).
+  #    be interop-down while the rule works fine). When interop is DOWN, netsh's
+  #    empty answer means nothing — do not send the operator on a UAC round trip
+  #    for a rule that probably still exists; hand them the Windows-side rescue.
   if [ -z "$(portproxy_rule)" ] && ! winside >/dev/null; then
+    if ! interop_ok; then
+      resolve_win 2>/dev/null || true
+      [ -n "${WINHOME:-}" ] && { mkdir -p "$WINHOME/.wsl-cdp" 2>/dev/null; cp "$HERE/wsl-cdp-setup.ps1" "$WINHOME/.wsl-cdp/" 2>/dev/null; }
+      echo "FAIL WSL->Windows interop is DOWN (vsock): WSL can neither verify netsh nor launch a browser." >&2
+      echo "     Recover from the WINDOWS side (file access still works):" >&2
+      echo "       1. elevated PowerShell:  powershell -NoProfile -ExecutionPolicy Bypass -File ${WIN_DOT:-C:\\Users\\<you>\\.wsl-cdp}\\wsl-cdp-setup.ps1 -ProxyPort $PROXY_PORT -BrowserPort $PORT" >&2
+      echo "       2. normal PowerShell:    paste the output of: wsl-cdp print-launch --windows" >&2
+      echo "     then rerun 'wsl-cdp up' — it adopts the running browser; the relay itself needs no interop." >&2
+      echo "     Durable fix: wsl.exe --shutdown from a Windows terminal (kills ALL WSL sessions); interop also often heals itself." >&2
+      return 1
+    fi
     echo "FAIL no netsh portproxy rule for port $PROXY_PORT on the Windows side." >&2
     echo "     One-time fix (elevated, UAC): wsl-cdp setup-windows" >&2
     return 1
@@ -445,6 +478,15 @@ cmd_up() {
   if ! winside >/dev/null; then
     resolve_win || return 1
     [ -n "$BROWSER_EXE" ] && [ -x "$BROWSER_EXE" ] || { echo "FAIL no Chrome/Edge/Brave found (set WSL_CDP_BROWSER=/mnt/c/.../browser.exe)" >&2; return 1; }
+    # Launching a Windows exe rides the same interop channel as netsh; when it
+    # is down the exec silently no-ops (backgrounded + disowned) and the 20s
+    # wait below would misread as a firewall problem. Say the true thing.
+    if ! interop_ok; then
+      echo "FAIL cannot launch the browser: WSL->Windows interop is down (vsock)." >&2
+      echo "     Launch from Windows instead — paste the output of: wsl-cdp print-launch --windows" >&2
+      echo "     then rerun 'wsl-cdp up' (it adopts an already-running browser)." >&2
+      return 1
+    fi
     echo "launching $(basename "$BROWSER_EXE") (agent profile $WIN_PROFILE)..."
     harden_profile
     launch_browser
@@ -579,6 +621,11 @@ cmd_doctor() {
     echo "WARN windows-user  undetected (interop down + ambiguous $USERS_ROOT) — set WSL_CDP_WINUSER; browser check skipped"
   fi
   echo "networking-mode: $(wslinfo --networking-mode 2>/dev/null || echo unknown) (this bridge assumes NAT; under mirrored you may not need the portproxy)"
+  if interop_ok; then
+    echo "ok   interop        WSL->Windows exec channel answers (cmd.exe probe)"
+  else
+    echo "WARN interop        WSL->Windows interop is DOWN (vsock) — netsh/browser results below are unverifiable; recover from Windows: elevated wsl-cdp-setup.ps1 + 'wsl-cdp print-launch --windows'; durable fix: wsl.exe --shutdown (from Windows)"
+  fi
   if [ -n "$WINUSER" ]; then
     if [ -n "$BROWSER_EXE" ] && [ -x "$BROWSER_EXE" ]; then echo "ok   browser        $BROWSER_EXE"; else echo "FAIL browser        none of Chrome/Edge/Brave found (set WSL_CDP_BROWSER)"; fi
     # Hygiene: the store FILE existing is normal (Chrome recreates it empty);
@@ -605,7 +652,7 @@ cmd_doctor() {
   # is empty on some builds), so filter that out to list only the OTHERS.
   local cur others
   cur="${WSL_DISTRO_NAME:-$(wslinfo --name 2>/dev/null | tr -d '\r\0')}"
-  others="$(wsl.exe -l -q 2>/dev/null | tr -d '\0\r' | grep -v -i -x -F "$cur" | grep -v '^[[:space:]]*$' | paste -sd, - 2>/dev/null || true)"
+  others="$(win_exec wsl.exe -l -q | tr -d '\0\r' | grep -v -i -x -F "$cur" | grep -v '^[[:space:]]*$' | paste -sd, - 2>/dev/null || true)"
   [ -n "$others" ] && echo "WARN co-distros     other WSL2 distros share this network namespace and can reach 127.0.0.1:$PORT (the debug port has no auth): $others"
   local rule; rule="$(portproxy_rule)"
   if [ -n "$rule" ]; then
@@ -614,12 +661,16 @@ cmd_doctor() {
     # netsh rides WSL interop and can be down while the rule works fine; the
     # TCP probe through the rule is the proof that matters (issue #4).
     echo "ok   portproxy      netsh unverifiable (interop down) — proven working by the windows-side probe"
+  elif ! interop_ok; then
+    # Do NOT report "no rule" on the strength of a dead netsh: that misread
+    # cost a needless UAC round trip on 2026-08-08.
+    echo "WARN portproxy      unverifiable: interop down AND windows side dark — if the bridge worked before, the rule likely survives; see the interop row above"
   else
     echo "FAIL portproxy      no v4tov4 rule for $PROXY_PORT — run: wsl-cdp setup-windows"
   fi
   # Stale-rule detection: ANY portproxy rule listening on the browser's own port
   # can grab 127.0.0.1:$PORT before the browser binds it, pushing it to [::1].
-  local stale; stale="$(netsh.exe interface portproxy show v4tov4 2>/dev/null | tr -d '\r' | awk -v p="$PORT" '$2 == p {print}')"
+  local stale; stale="$(win_exec netsh.exe interface portproxy show v4tov4 | tr -d '\r' | awk -v p="$PORT" '$2 == p {print}')"
   [ -n "$stale" ] && echo "WARN stale rule     a portproxy rule listens on the browser's port $PORT — this races the browser's own bind; delete it (setup-windows does): $stale"
   cmd_status
   local rc=$?
@@ -648,10 +699,17 @@ cmd_setup_windows() {
   wrapped="& { $ps1 } -ProxyPort $PROXY_PORT -BrowserPort $PORT"
   b64="$(printf '%s' "$wrapped" | python3 -c 'import sys,base64;sys.stdout.write(base64.b64encode(sys.stdin.buffer.read().decode("utf-8","surrogateescape").encode("utf-16-le")).decode())')" \
     || { echo "wsl-cdp: failed to encode the setup script" >&2; return 1; }
+  if ! interop_ok; then
+    mkdir -p "$WINHOME/.wsl-cdp" 2>/dev/null
+    cp "$HERE/wsl-cdp-setup.ps1" "$WINHOME/.wsl-cdp/wsl-cdp-setup.ps1" 2>/dev/null
+    echo "wsl-cdp: cannot trigger UAC — WSL->Windows interop is down (vsock). Run it from the Windows side:" >&2
+    echo "  elevated PowerShell> powershell -NoProfile -ExecutionPolicy Bypass -File $WIN_DOT\\wsl-cdp-setup.ps1 -ProxyPort $PROXY_PORT -BrowserPort $PORT" >&2
+    return 1
+  fi
   echo "Triggering elevated Windows setup (UAC prompt on the Windows side)..."
-  powershell.exe -NoProfile -Command \
+  WIN_EXEC_TIMEOUT=20 win_exec powershell.exe -NoProfile -Command \
     "Start-Process powershell -Verb RunAs -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-EncodedCommand','$b64'" \
-    2>/dev/null || true
+    || true
   local i=0
   until [ -n "$(portproxy_rule)" ] || [ $i -ge 24 ]; do
     sleep 5; i=$((i+1))
@@ -712,12 +770,16 @@ usage: wsl-cdp <command>
   tabs [--json] | open URL | close ID                     tab management (HTTP CDP)
   eval JS [TAB] | text [TAB]                              page access (needs node >=22)
   screenshot [FILE] [TAB]
+  upload FILE SELECTOR [TAB]                 set FILE on a file-input (drives
+                                             upload UIs that have no API)
   browsers [--json]                          installed browsers in autodetect rank
                                              order + recommended/running/recorded
   harden                                     scrub saved passwords + disable the
                                              password-save/sign-in UI (also auto-
                                              runs at every up launch)
-  print-launch                               show the exact browser command line
+  print-launch [--windows]                   exact browser command line (--windows:
+                                             PowerShell-paste-ready, for interop
+                                             outages — launch by hand, up adopts)
   setup-windows                              one-time elevated Windows half (UAC)
   mcp-add                                    per-repo chrome-devtools-mcp entry
 
@@ -725,6 +787,7 @@ Machine output: status/doctor/tabs/browsers accept --json. tabs/open emit TSV
 rows: <id>\t<url>; browsers emits <rank>\t<name>\t<path>\t<flags>.
 Exit codes: 0 ok · 1 chain/forwarder down · 2 usage/invalid argument · 3 end-to-end fail.
 Env: WSL_CDP_PORT WSL_CDP_PROXY_PORT WSL_CDP_WINUSER WSL_CDP_BROWSER WSL_CDP_USERS_ROOT
+     WSL_CDP_WIN_EXEC_TIMEOUT (8s; per-call ceiling on Windows-exe interop calls)
 EOF
 }
 
@@ -777,8 +840,39 @@ case "$cmd" in
                    echo "wsl-cdp: hardening INCOMPLETE — see the WARNs above, fix, and rerun" >&2
                    exit 1
                  fi ;;
-  print-launch)  no_args "$@"; resolve_win || exit 1
-                 { printf '%s ' "$BROWSER_EXE"; launch_argv | tr '\n' ' '; echo; } ;;
+  print-launch)  WINFMT=0
+                 for arg in "$@"; do case "$arg" in
+                   --windows) WINFMT=1 ;;
+                   *) echo "wsl-cdp: unknown option '$arg' for print-launch (supported: --windows)" >&2; exit 2 ;;
+                 esac; done
+                 resolve_win || exit 1
+                 if [ "$WINFMT" = 1 ]; then
+                   # PowerShell-paste-ready: Windows path via wslpath (works
+                   # without interop — it is drvfs mapping, not vsock), every
+                   # arg quoted (covers '*' and spaces), '&' for the quoted exe.
+                   wexe="$(wslpath -w "$BROWSER_EXE" 2>/dev/null || printf '%s' "$BROWSER_EXE")"
+                   { printf '& "%s"' "$wexe"
+                     while IFS= read -r a; do printf ' "%s"' "$a"; done < <(launch_argv)
+                     echo; }
+                 else
+                   { printf '%s ' "$BROWSER_EXE"; launch_argv | tr '\n' ' '; echo; }
+                 fi ;;
+  upload)        [ $# -ge 2 ] || { echo "usage: wsl-cdp upload FILE SELECTOR [TAB_ID]" >&2; exit 2; }
+                 upf="$1"; upsel="$2"; uptab="${3:-}"
+                 [ -f "$upf" ] || { echo "wsl-cdp: no such file: $upf" >&2; exit 2; }
+                 need_node; need_chain
+                 resolve_win || exit 1
+                 # The browser opens the file, so it needs a WINDOWS-readable
+                 # path: /mnt/<drive> paths translate via wslpath; anything on
+                 # the Linux side is staged into the profile dir first (9p).
+                 case "$upf" in
+                   /mnt/[a-zA-Z]/*) upwin="$(wslpath -w "$upf")" ;;
+                   *) mkdir -p "$WINHOME/.wsl-cdp/uploads" 2>/dev/null \
+                        && cp "$upf" "$WINHOME/.wsl-cdp/uploads/$(basename "$upf")" 2>/dev/null \
+                        || { echo "wsl-cdp: cannot stage $upf on the Windows side ($WINHOME/.wsl-cdp/uploads)" >&2; exit 1; }
+                      upwin="$WIN_DOT\\uploads\\$(basename "$upf")" ;;
+                 esac
+                 WSL_CDP_PORT="$PORT" node "$DRIVE" upload "$upwin" "$upsel" "$uptab" ;;
   tabs)          need_chain
                  body="$(curl -sf -m 5 "http://127.0.0.1:$PORT/json/list")" || cdp_fail "/json/list" $?
                  if [ "$JSON" = 1 ]; then

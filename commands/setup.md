@@ -2,7 +2,7 @@
 description: Guided one-time wsl-cdp setup — install, the elevated Windows step, first logins, verified end-to-end.
 ---
 
-Walk the user through first-time wsl-cdp setup. They should be at the machine: one UAC click and the first site logins are theirs. Narrate each step before you run it.
+Walk the user through first-time wsl-cdp setup. They should be at the machine: one UAC click and the first site logins are theirs. Narrate each step before you run it. If this text and the installed `wsl-cdp --help` disagree (plugin-cache lag), the installed CLI wins.
 
 1. **Route check.** `grep -qi microsoft /proc/version` — if not WSL2, stop: they should use the official Claude in Chrome extension instead, and this setup does not apply.
 2. **Install.** `command -v wsl-cdp || bash "${CLAUDE_PLUGIN_ROOT}/install.sh"` — then `wsl-cdp doctor` to show the baseline (expect FAILs before the Windows step; that is normal).

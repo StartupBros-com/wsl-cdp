@@ -5,6 +5,11 @@
 //   eval <js> [tabId]         Runtime.evaluate, returnByValue, prints the value as JSON
 //   text [tabId]              document.body.innerText of the tab
 //   screenshot <file> [tabId] Page.captureScreenshot (png) written to <file>
+//   upload <winPath> <selector> [tabId]
+//                             DOM.setFileInputFiles on the matched file input,
+//                             then dispatches input+change so page JS reacts.
+//                             winPath must be a WINDOWS path the browser can
+//                             read (the CLI wrapper handles staging/translation).
 //
 // Tab selection: explicit tabId, else the first "page" target.
 const PORT = process.env.WSL_CDP_PORT || "9223";
@@ -78,7 +83,7 @@ async function evaluate(cdp, expression) {
   return r.result.value;
 }
 
-const [cmd, a1, a2] = process.argv.slice(2);
+const [cmd, a1, a2, a3] = process.argv.slice(2);
 try {
   if (cmd === "eval") {
     if (!a1) throw new Error("usage: wsl-cdp eval JS [TAB_ID]");
@@ -105,8 +110,27 @@ try {
     writeFileSync(a1, buf);
     console.log(`${a1} (${buf.length} bytes, tab ${t.id})`);
     cdp.close();
+  } else if (cmd === "upload") {
+    if (!a1 || !a2) throw new Error("usage: wsl-cdp upload FILE SELECTOR [TAB_ID]");
+    const t = await target(a3 || undefined);
+    const cdp = await connect(t.webSocketDebuggerUrl);
+    await cdp.send("DOM.enable");
+    const { root } = await cdp.send("DOM.getDocument", { depth: 1 });
+    const { nodeId } = await cdp.send("DOM.querySelector", { nodeId: root.nodeId, selector: a2 });
+    if (!nodeId) throw new Error(`no element matches selector: ${a2}`);
+    await cdp.send("DOM.setFileInputFiles", { files: [a1], nodeId });
+    // setFileInputFiles alone does not reliably fire the page's own handlers
+    // (measured against GitHub's social-preview uploader): dispatch input +
+    // change on the same selector so uploader JS reacts.
+    await evaluate(cdp, `(() => {
+      const el = document.querySelector(${JSON.stringify(a2)});
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+      return true; })()`);
+    console.log(`upload set: ${a1} -> ${a2} (tab ${t.id}); the page's own uploader takes it from here`);
+    cdp.close();
   } else {
-    console.error("usage: wsl-cdp <eval|text|screenshot> ...");
+    console.error("usage: wsl-cdp <eval|text|screenshot|upload> ...");
     process.exit(2);
   }
   process.exit(0);
