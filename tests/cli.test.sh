@@ -343,6 +343,51 @@ assert_exit "upload (no args) -> 2" 2 "$CLI" upload
 assert_exit "upload (one arg) -> 2" 2 "$CLI" upload /tmp/x
 assert_exit "upload missing file -> 2" 2 "$CLI" upload /nonexistent-file.png "input"
 
+# --- v0.3.4 review fixes: config validation, JSON parity, gated latency,
+#     honest rescue without a resolvable user, staged-upload hygiene
+assert_exit "WIN_EXEC_TIMEOUT=abc -> 2" 2 env WSL_CDP_WIN_EXEC_TIMEOUT=abc "$CLI" url
+
+dj="$(WSL_CDP_WIN_EXEC_TIMEOUT=1 PATH="$fx5/hang:$PATH" \
+  WSL_CDP_USERS_ROOT="$fx5/users" WSL_CDP_WINUSER=testuser HOME="$fx5/home" \
+  WSL_CDP_PORT=9333 WSL_CDP_PROXY_PORT=9334 timeout 60 "$CLI" doctor --json 2>/dev/null)"
+if printf '%s' "$dj" | jq -e '.env.interop == false' >/dev/null 2>&1; then
+  _ok "doctor --json carries env.interop=false under the wedge"
+else
+  _no "doctor --json missing/wrong interop field: $(printf '%s' "$dj" | jq -c '.env // empty' 2>/dev/null)"
+fi
+
+# gated wedge latency: pre-gate code took >=16s at a 2s timeout (3x netsh retry
+# + wsl.exe + stale netsh each independently re-probed); gated must stay well under
+wedge_s=$(date +%s)
+WSL_CDP_WIN_EXEC_TIMEOUT=2 PATH="$fx5/hang:$PATH" \
+  WSL_CDP_USERS_ROOT="$fx5/users" WSL_CDP_WINUSER=testuser HOME="$fx5/home" \
+  WSL_CDP_PORT=9333 WSL_CDP_PROXY_PORT=9334 timeout 60 "$CLI" doctor >/dev/null 2>&1
+wedge_e=$(date +%s)
+if [ $((wedge_e - wedge_s)) -lt 15 ]; then
+  _ok "wedged doctor short-circuits on the interop verdict ($((wedge_e - wedge_s))s)"
+else
+  _no "wedged doctor too slow: $((wedge_e - wedge_s))s (gates not consulted?)"
+fi
+
+# rescue with NO resolvable Windows user: must not name a file it never staged
+mkdir -p "$fx5/empty-users"
+resc="$(WSL_CDP_WIN_EXEC_TIMEOUT=1 PATH="$fx5/hang:$PATH" \
+  WSL_CDP_USERS_ROOT="$fx5/empty-users" HOME="$fx5/home2" \
+  WSL_CDP_PORT=9333 WSL_CDP_PROXY_PORT=9334 timeout 60 "$CLI" up 2>&1 >/dev/null)"
+assert_contains "unresolvable-user rescue says copy-it-yourself" "$resc" "copy "
+case "$resc" in *'C:\Users\<you>'*) _no "rescue still prints a placeholder staged path" ;; *) _ok "no phantom staged-script path" ;; esac
+
+# staged uploads are cleared by harden and flagged by nothing afterwards
+mkdir -p "$fx4/users/testuser/.wsl-cdp/uploads"
+printf 'x' >"$fx4/users/testuser/.wsl-cdp/uploads/leftover.bin"
+h_out="$(harden_run)"
+assert_contains "harden clears staged uploads" "$h_out" "cleared 1 staged upload"
+if [ -f "$fx4/users/testuser/.wsl-cdp/uploads/leftover.bin" ]; then
+  _no "staged upload survived harden"
+else
+  _ok "staged upload removed by harden"
+fi
+
 # --- status --json: valid JSON, documented shape, ok:false when the chain is down
 sj="$(WSL_CDP_PORT=9333 WSL_CDP_PROXY_PORT=9334 "$CLI" status --json 2>/dev/null)"
 if printf '%s' "$sj" | jq -e '.ok==false and (.exit|type=="number") and (.checks|length==3) and (.checks[0]|has("status") and has("name") and has("detail"))' >/dev/null 2>&1; then
