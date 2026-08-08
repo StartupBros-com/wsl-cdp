@@ -86,6 +86,76 @@ else
   _ok "override leaves the winuser cache unwritten"
 fi
 
+# --- browsers verb (v0.3.2): rank-ordered enumeration, flags, machine shape.
+#     Fresh fixture: the waterfall above deleted $fx's browsers. A shimmed
+#     no-output tasklist.exe ("interop down") makes `running` deterministic on
+#     real WSL boxes, where the genuine tasklist would answer.
+fx2="$(make_fixture)"
+mkdir -p "$fx2/bin-down"
+printf '#!/usr/bin/env bash\nexit 0\n' >"$fx2/bin-down/tasklist.exe"
+chmod +x "$fx2/bin-down/tasklist.exe"
+browsers_run(){ PATH="$fx2/bin-down:$PATH" WSL_CDP_USERS_ROOT="$fx2/users" \
+  WSL_CDP_WINUSER=testuser \
+  WSL_CDP_PROGRAMFILES="$fx2/pf" WSL_CDP_PROGRAMFILES_X86="$fx2/pf86" \
+  HOME="$fx2/home" "$CLI" browsers "$@" 2>/dev/null; }
+bt="$(browsers_run)"
+assert_eq "browsers lists all six installs" 6 "$(printf '%s\n' "$bt" | wc -l)"
+assert_contains "browsers rank 1 is system Chrome" "$(printf '%s\n' "$bt" | head -1)" "pf/Google/Chrome"
+assert_contains "browsers rank 1 carries recommended" "$(printf '%s\n' "$bt" | head -1)" "recommended"
+assert_exit "browsers --xml -> 2" 2 "$CLI" browsers --xml
+assert_exit "browsers stray positional -> 2" 2 "$CLI" browsers stray
+
+bj="$(browsers_run --json)"
+if printf '%s' "$bj" | jq -e --arg p "$(fixture_chrome "$fx2")" '
+     (.browsers|length)==6 and .browsers[0].name=="chrome"
+     and .browsers[0].recommended==true and .browsers[0].running==null
+     and .source=="autodetect" and .selected==$p' >/dev/null 2>&1; then
+  _ok "browsers --json well-shaped (running null when interop absent)"
+else
+  _no "browsers --json shape wrong: $bj"
+fi
+
+# --- browsers: a recorded profile owner is flagged and wins selection
+mkdir -p "$fx2/users/testuser/.wsl-cdp"
+printf '%s' "$(fixture_brave "$fx2")" >"$fx2/users/testuser/.wsl-cdp/browser"
+bj="$(browsers_run --json)"
+if printf '%s' "$bj" | jq -e --arg p "$(fixture_brave "$fx2")" '
+     .source=="recorded" and .selected==$p
+     and ([.browsers[]|select(.recorded)] | length==1 and all(.name=="brave"))' >/dev/null 2>&1; then
+  _ok "browsers --json surfaces the recorded profile owner"
+else
+  _no "browsers --json recorded shape wrong: $bj"
+fi
+rm -f "$fx2/users/testuser/.wsl-cdp/browser"
+
+# --- browsers: running flags through a tasklist.exe seam (brave live, rest not)
+mkdir -p "$fx2/bin"
+cat >"$fx2/bin/tasklist.exe" <<'SHIM'
+#!/usr/bin/env bash
+case "$*" in
+  *brave.exe*) printf '"brave.exe","4242","Console","1","123,456 K"\n' ;;
+  *) printf 'INFO: No tasks are running which match the specified criteria.\n' ;;
+esac
+SHIM
+chmod +x "$fx2/bin/tasklist.exe"
+bj="$(PATH="$fx2/bin:$PATH" WSL_CDP_USERS_ROOT="$fx2/users" WSL_CDP_WINUSER=testuser \
+  WSL_CDP_PROGRAMFILES="$fx2/pf" WSL_CDP_PROGRAMFILES_X86="$fx2/pf86" \
+  HOME="$fx2/home" "$CLI" browsers --json 2>/dev/null)"
+if printf '%s' "$bj" | jq -e '
+     ([.browsers[]|select(.name=="brave")] | length==2 and all(.running==true))
+     and ([.browsers[]|select(.name!="brave")] | length==4 and all(.running==false))' >/dev/null 2>&1; then
+  _ok "browsers running flags via tasklist seam"
+else
+  _no "browsers running flags wrong: $bj"
+fi
+
+# --- browsers: zero installs is a loud exit 1, not an empty success
+fx3="$(mktemp -d "${TMPDIR:-/tmp}/wslcdp-none.XXXXXX")"
+mkdir -p "$fx3/users/testuser/AppData/Local/Temp" "$fx3/home"
+assert_exit "browsers with no installs -> 1" 1 env WSL_CDP_USERS_ROOT="$fx3/users" \
+  WSL_CDP_WINUSER=testuser WSL_CDP_PROGRAMFILES="$fx3/pf" \
+  WSL_CDP_PROGRAMFILES_X86="$fx3/pf86" HOME="$fx3/home" "$CLI" browsers
+
 # --- status --json: valid JSON, documented shape, ok:false when the chain is down
 sj="$(WSL_CDP_PORT=9333 WSL_CDP_PROXY_PORT=9334 "$CLI" status --json 2>/dev/null)"
 if printf '%s' "$sj" | jq -e '.ok==false and (.exit|type=="number") and (.checks|length==3) and (.checks[0]|has("status") and has("name") and has("detail"))' >/dev/null 2>&1; then

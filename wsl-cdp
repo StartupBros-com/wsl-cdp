@@ -81,7 +81,7 @@ detect_winuser() {
   [ -n "$best" ] && printf '%s' "$best"
 }
 
-detect_browser() { # first hit wins: Chrome (system, user), Edge (x86, 64-bit), Brave (user, system)
+browser_candidates() { # rank order: Chrome (system, user), Edge (x86, 64-bit), Brave (user, system)
   # Chrome/Edge outrank Brave (v0.3.1): Chrome is the most common install and
   # Edge ships on every Windows box, so a stock machine works with zero config.
   # Brave is LAST because its updater stages a versioned-install swap that can
@@ -90,16 +90,22 @@ detect_browser() { # first hit wins: Chrome (system, user), Edge (x86, 64-bit), 
   # (--user-data-dir isolates the profile, not the shared install). Brave still
   # works when it is the only browser, or pinned via WSL_CDP_BROWSER. Once a
   # profile has been launched, profile_browser() outranks this order entirely.
-  local c
-  for c in \
+  # Shared by detect_browser AND cmd_browsers so the list the operator sees is
+  # BY CONSTRUCTION the list detection walks.
+  printf '%s\n' \
     "$PROGRAMFILES/Google/Chrome/Application/chrome.exe" \
     "$WINHOME/AppData/Local/Google/Chrome/Application/chrome.exe" \
     "$PROGRAMFILES_X86/Microsoft/Edge/Application/msedge.exe" \
     "$PROGRAMFILES/Microsoft/Edge/Application/msedge.exe" \
     "$WINHOME/AppData/Local/BraveSoftware/Brave-Browser/Application/brave.exe" \
-    "$PROGRAMFILES/BraveSoftware/Brave-Browser/Application/brave.exe"; do
+    "$PROGRAMFILES/BraveSoftware/Brave-Browser/Application/brave.exe"
+}
+
+detect_browser() { # first hit wins
+  local c
+  while IFS= read -r c; do
     [ -x "$c" ] && { printf '%s' "$c"; return; }
-  done
+  done < <(browser_candidates)
 }
 
 profile_browser() {
@@ -116,6 +122,76 @@ profile_browser() {
   b="$(cat "$f" 2>/dev/null)"
   [ -n "$b" ] && [ -x "$b" ] && printf '%s' "$b"
   return 0
+}
+
+running_of() { # running_of IMAGENAME (e.g. brave.exe) -> true|false|null; memoized
+  # tasklist.exe rides WSL interop: when it is down (or absent, as in CI) the
+  # honest answer is null/unknown, never false. Memoized per image name because
+  # one interop round trip costs ~100-300ms and cmd_browsers may ask repeatedly
+  # (user + system installs share an image name).
+  local n="$1" var out v
+  var="_RUN_${n%%.*}"
+  [ -n "${!var:-}" ] && { printf '%s' "${!var}"; return; }
+  # </dev/null is load-bearing: cmd_browsers calls this inside a `while read`
+  # loop fed by process substitution, and an interop child inheriting that
+  # stdin DRAINS it — measured truncating enumeration to one row.
+  out="$(tasklist.exe /FO CSV /FI "IMAGENAME eq $n" </dev/null 2>/dev/null | tr -d '\r')"
+  if [ -z "$out" ]; then v=null
+  elif printf '%s' "$out" | grep -qi "\"$n\""; then v=true
+  else v=false; fi
+  printf -v "$var" '%s' "$v"
+  printf '%s' "$v"
+}
+
+cmd_browsers() {
+  # Enumerate every INSTALLED candidate in detection rank order, so a human (or
+  # the /wsl-cdp:setup flow) can make the vendor choice an explicit decision
+  # instead of a silent autodetect — the first launch binds the profile to a
+  # vendor (profile_browser), which makes this the choice worth surfacing.
+  # Flags: recommended = what autodetect would pick (rank 1);
+  #        running     = an instance of that image is live on Windows (a running
+  #                      Brave is the update-loop contention warning; a running
+  #                      Chrome/Edge is harmless — their swap waits for relaunch);
+  #        recorded    = the profile's owner per profile_browser().
+  # Text mode emits TSV rows <rank>\t<name>\t<path>\t<flags> (flags "-" if none);
+  # --json wraps rows with {selected, source} = what `up` would actually use now.
+  resolve_win || return 1
+  local rec="" f="$WINHOME/.wsl-cdp/browser"
+  [ -f "$f" ] && rec="$(cat "$f" 2>/dev/null)"
+  local source="autodetect"
+  if [ -n "${WSL_CDP_BROWSER:-}" ]; then source="override"
+  elif [ -n "$rec" ] && [ "$rec" = "${BROWSER_EXE:-}" ]; then source="recorded"
+  fi
+  [ -n "${BROWSER_EXE:-}" ] || source="none"
+  local rows=() c rank=0 name run flags
+  while IFS= read -r c; do
+    [ -x "$c" ] || continue
+    rank=$((rank+1))
+    name="$(basename "$c" .exe)"; [ "$name" = msedge ] && name=edge
+    run="$(running_of "$(basename "$c")")"
+    flags=""
+    [ "$rank" -eq 1 ] && flags="recommended"
+    [ "$run" = true ] && flags="${flags:+$flags,}running"
+    [ -n "$rec" ] && [ "$c" = "$rec" ] && flags="${flags:+$flags,}recorded"
+    rows+=("$rank"$'\t'"$name"$'\t'"$c"$'\t'"$run"$'\t'"${flags:--}")
+  done < <(browser_candidates)
+  if [ "${JSON:-0}" = 1 ]; then
+    command -v jq >/dev/null 2>&1 || { echo "wsl-cdp: jq required for browsers --json" >&2; return 1; }
+    { [ ${#rows[@]} -gt 0 ] && printf '%s\n' "${rows[@]}"; true; } \
+      | jq -R 'split("\t") | {rank: (.[0]|tonumber), name: .[1], path: .[2],
+               running: (if .[3]=="true" then true elif .[3]=="false" then false else null end),
+               recorded: ((.[4]|split(",")|index("recorded")) != null),
+               recommended: ((.[4]|split(",")|index("recommended")) != null)}' \
+      | jq -s --arg sel "${BROWSER_EXE:-}" --arg src "$source" \
+          '{browsers: ., selected: (if $sel=="" then null else $sel end), source: $src}'
+  else
+    local r a b p fl
+    for r in "${rows[@]}"; do
+      IFS=$'\t' read -r a b p _ fl <<<"$r"
+      printf '%s\t%s\t%s\t%s\n' "$a" "$b" "$p" "$fl"
+    done
+  fi
+  [ ${#rows[@]} -gt 0 ] || { echo "wsl-cdp: no Chrome/Edge/Brave install found (set WSL_CDP_BROWSER)" >&2; return 1; }
 }
 
 # Resolved lazily: only commands that touch the Windows side of the launch/setup
@@ -487,11 +563,14 @@ usage: wsl-cdp <command>
   tabs [--json] | open URL | close ID                     tab management (HTTP CDP)
   eval JS [TAB] | text [TAB]                              page access (needs node >=22)
   screenshot [FILE] [TAB]
+  browsers [--json]                          installed browsers in autodetect rank
+                                             order + recommended/running/recorded
   print-launch                               show the exact browser command line
   setup-windows                              one-time elevated Windows half (UAC)
   mcp-add                                    per-repo chrome-devtools-mcp entry
 
-Machine output: status/doctor/tabs accept --json. tabs/open emit TSV rows: <id>\t<url>.
+Machine output: status/doctor/tabs/browsers accept --json. tabs/open emit TSV
+rows: <id>\t<url>; browsers emits <rank>\t<name>\t<path>\t<flags>.
 Exit codes: 0 ok · 1 chain/forwarder down · 2 usage/invalid argument · 3 end-to-end fail.
 Env: WSL_CDP_PORT WSL_CDP_PROXY_PORT WSL_CDP_WINUSER WSL_CDP_BROWSER WSL_CDP_USERS_ROOT
 EOF
@@ -509,7 +588,7 @@ case "$cmd" in -h|--help|help) print_usage; exit 0 ;; esac
 # `tabs --xml` must be a loud error, never a success exit with the default output.
 JSON=0
 case "$cmd" in
-  status|doctor|tabs)
+  status|doctor|tabs|browsers)
     for arg in "$@"; do case "$arg" in
       --json) JSON=1 ;;
       -*) echo "wsl-cdp: unknown option '$arg' for '$cmd' (supported: --json)" >&2; exit 2 ;;
@@ -523,6 +602,7 @@ case "$cmd" in
   status)        cmd_status ;;
   doctor)        cmd_doctor ;;
   url)           no_args "$@"; echo "http://127.0.0.1:$PORT" ;;
+  browsers)      cmd_browsers ;;
   print-launch)  no_args "$@"; resolve_win || exit 1
                  { printf '%s ' "$BROWSER_EXE"; launch_argv | tr '\n' ' '; echo; } ;;
   tabs)          need_chain
