@@ -48,6 +48,7 @@ assert_contains "print-launch pairs the dedicated profile" "$argv" 'user-data-di
 
 # --- launch argv suppresses in-process updater/background churn (v0.3.1:
 #     a fresh agent profile must not kick off update churn; Brave relaunch loop)
+assert_contains "argv disables browser sync" "$argv" "--disable-sync"
 assert_contains "argv disables background networking" "$argv" "--disable-background-networking"
 assert_contains "argv stretches the component-update interval" "$argv" "--component-update-interval-in-sec="
 assert_contains "argv stretches the staged-update poll" "$argv" "--check-for-update-interval="
@@ -164,6 +165,97 @@ assert_exit "browsers with no installs -> 1" 1 env WSL_CDP_USERS_ROOT="$fx3/user
   WSL_CDP_WINUSER=testuser WSL_CDP_PROGRAMFILES="$fx3/pf" \
   WSL_CDP_PROGRAMFILES_X86="$fx3/pf86" HOME="$fx3/home" "$CLI" browsers
 
+# --- harden / profile hygiene (v0.3.3): pref seeding, merge-not-clobber,
+#     password scrub that spares sessions, empty-store no-op
+fx4="$(make_fixture)"
+harden_run(){ WSL_CDP_USERS_ROOT="$fx4/users" WSL_CDP_WINUSER=testuser \
+  WSL_CDP_PROGRAMFILES="$fx4/pf" WSL_CDP_PROGRAMFILES_X86="$fx4/pf86" \
+  HOME="$fx4/home" "$CLI" harden 2>/dev/null; }
+prefs="$fx4/users/testuser/.wsl-cdp/profile/Default/Preferences"
+pdefault="$fx4/users/testuser/.wsl-cdp/profile/Default"
+
+assert_exit "harden extra arg -> 2" 2 "$CLI" harden extra
+
+h_out="$(harden_run)"; h_rc=$?
+assert_eq "harden exits 0" 0 "$h_rc"
+assert_contains "harden reports what it did" "$h_out" "hardened"
+if jq -e '.credentials_enable_service==false and .credentials_enable_autosignin==false
+          and .signin.allowed_on_next_startup==false' "$prefs" >/dev/null 2>&1; then
+  _ok "harden seeds the hygiene prefs"
+else
+  _no "harden prefs wrong: $(cat "$prefs" 2>/dev/null)"
+fi
+
+python3 - "$prefs" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+d["homepage"] = "https://example.com"
+json.dump(d, open(sys.argv[1], "w"))
+PY
+harden_run >/dev/null
+if jq -e '.homepage=="https://example.com" and .credentials_enable_service==false' "$prefs" >/dev/null 2>&1; then
+  _ok "harden merges into existing Preferences (no clobber)"
+else
+  _no "harden clobbered Preferences: $(cat "$prefs" 2>/dev/null)"
+fi
+
+python3 - "$pdefault/Login Data" <<'PY'
+import os, sqlite3, sys
+os.makedirs(os.path.dirname(sys.argv[1]), exist_ok=True)
+c = sqlite3.connect(sys.argv[1])
+c.execute("create table logins (origin_url text, username_value text, password_value blob)")
+c.execute("insert into logins values ('https://github.com','will',x'00')")
+c.execute("insert into logins values ('https://example.com','will',x'00')")
+c.commit(); c.close()
+PY
+touch "$pdefault/Cookies"
+h_out="$(harden_run)"
+assert_contains "harden scrubs and counts saved passwords" "$h_out" "scrubbed 2 saved password"
+if [ -f "$pdefault/Login Data" ]; then _no "Login Data survived the scrub"; else _ok "Login Data removed by the scrub"; fi
+if [ -f "$pdefault/Cookies" ]; then _ok "Cookies (sessions) untouched by the scrub"; else _no "scrub deleted Cookies"; fi
+
+python3 - "$pdefault/Login Data" <<'PY'
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+c.execute("create table logins (origin_url text, username_value text, password_value blob)")
+c.commit(); c.close()
+PY
+h_out="$(harden_run)"
+case "$h_out" in *scrubbed*) _no "harden scrub-noticed an empty store" ;; *) _ok "empty password store: no scrub notice" ;; esac
+if [ -f "$pdefault/Login Data" ]; then _ok "empty store left in place"; else _no "empty store was deleted"; fi
+
+# --- harden failure honesty: a broken Preferences write must NOT report success
+printf 'not json{' >"$prefs"
+h_out="$(harden_run)"; h_rc=$?
+assert_eq "harden with corrupt Preferences -> 1" 1 "$h_rc"
+case "$h_out" in *hardened:*) _no "harden claimed success over a failed prefs write" ;; *) _ok "harden withholds success on a failed prefs write" ;; esac
+
+# a mangled-but-valid file with .signin as a non-object is coerced, not fatal
+printf '{"signin": true}' >"$prefs"
+h_out="$(harden_run)"; h_rc=$?
+assert_eq "harden coerces a non-object .signin -> 0" 0 "$h_rc"
+if jq -e '.signin.allowed_on_next_startup==false' "$prefs" >/dev/null 2>&1; then
+  _ok "non-object .signin coerced and pref set"
+else
+  _no "signin coercion failed: $(cat "$prefs" 2>/dev/null)"
+fi
+
+# mixed counts: readable store + unreadable store — count is qualified, not silently low
+rm -f "$pdefault/Login Data"
+python3 - "$pdefault/Login Data" <<'PY'
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+c.execute("create table logins (origin_url text, username_value text, password_value blob)")
+c.execute("insert into logins values ('https://github.com','will',x'00')")
+c.execute("insert into logins values ('https://example.com','will',x'00')")
+c.commit(); c.close()
+PY
+printf 'garbage-not-sqlite' >"$pdefault/Login Data For Account"
+h_out="$(harden_run)"
+assert_contains "mixed scrub reports the known count" "$h_out" "scrubbed 2 saved password"
+assert_contains "mixed scrub qualifies the unreadable store" "$h_out" "count was unreadable"
+if [ -f "$pdefault/Login Data For Account" ]; then _no "unreadable store survived"; else _ok "unreadable store removed too"; fi
+
 # --- up over an already-live bridge with WSL_CDP_BROWSER set: the explicit
 #     choice must not be DISCARDED silently (v0.3.2 review blocker). Fake
 #     /json/version server on a scratch port makes up return at step 0 —
@@ -191,6 +283,19 @@ up_err="$(WSL_CDP_PORT=$srv_port WSL_CDP_PROXY_PORT=9346 \
   WSL_CDP_BROWSER=/mnt/c/fake/browser.exe "$CLI" up 2>&1 >/dev/null)"
 up_rc=$?
 up_out="$(WSL_CDP_PORT=$srv_port WSL_CDP_PROXY_PORT=9346 "$CLI" up 2>/dev/null)"
+# no-launch path + saved passwords present: up must flag pending hygiene
+rm -f "$pdefault/Login Data"
+python3 - "$pdefault/Login Data" <<'PY'
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+c.execute("create table logins (origin_url text, username_value text, password_value blob)")
+c.execute("insert into logins values ('https://github.com','will',x'00')")
+c.commit(); c.close()
+PY
+up_hyg="$(WSL_CDP_PORT=$srv_port WSL_CDP_PROXY_PORT=9346 \
+  WSL_CDP_USERS_ROOT="$fx4/users" WSL_CDP_WINUSER=testuser \
+  HOME="$fx4/home" "$CLI" up 2>&1 >/dev/null)"
+assert_contains "up (no launch) flags pending hygiene" "$up_hyg" "hygiene applies at launch"
 kill "$srv_pid" 2>/dev/null
 assert_eq "up over a live bridge exits 0" 0 "$up_rc"
 assert_contains "up warns when the browser override is not applied" "$up_err" "WSL_CDP_BROWSER is set"
