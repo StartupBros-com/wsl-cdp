@@ -12,7 +12,12 @@ const BASE = `http://127.0.0.1:${PORT}`;
 const TIMEOUT_MS = 20000;
 
 async function target(tabId) {
-  const list = await (await fetch(`${BASE}/json/list`)).json();
+  let list;
+  try {
+    list = await (await fetch(`${BASE}/json/list`)).json();
+  } catch (e) {
+    throw new Error(`cannot reach the bridge at ${BASE}/json/list (${e.message}) — run: wsl-cdp doctor`);
+  }
   const t = tabId
     ? list.find((x) => x.id === tabId)
     : list.find((x) => x.type === "page");
@@ -25,7 +30,9 @@ function connect(wsUrl) {
     const ws = new WebSocket(wsUrl);
     const pending = new Map();
     let nextId = 1;
-    ws.onopen = () =>
+    let opened = false;
+    ws.onopen = () => {
+      opened = true;
       resolve({
         send(method, params = {}) {
           const id = nextId++;
@@ -39,7 +46,17 @@ function connect(wsUrl) {
         },
         close: () => ws.close(),
       });
-    ws.onerror = () => reject(new Error(`websocket connect failed: ${wsUrl}`));
+    };
+    ws.onerror = () => { if (!opened) reject(new Error(`websocket connect failed: ${wsUrl}`)); };
+    ws.onclose = () => {
+      // The tab was closed or the browser exited mid-request. Fail every
+      // in-flight call now instead of hanging until each per-call timer fires
+      // (or forever, for a call whose timer already fired but left the socket
+      // open). Pre-open closes are already surfaced by onerror.
+      const err = new Error("CDP websocket closed before response (tab closed or browser exited?)");
+      for (const { rej } of pending.values()) rej(err);
+      pending.clear();
+    };
     ws.onmessage = (ev) => {
       const msg = JSON.parse(ev.data);
       if (msg.id && pending.has(msg.id)) {
@@ -64,7 +81,7 @@ async function evaluate(cdp, expression) {
 const [cmd, a1, a2] = process.argv.slice(2);
 try {
   if (cmd === "eval") {
-    if (!a1) throw new Error("usage: wsl-cdp-drive eval <js> [tabId]");
+    if (!a1) throw new Error("usage: wsl-cdp eval JS [TAB_ID]");
     const t = await target(a2 || undefined);
     const cdp = await connect(t.webSocketDebuggerUrl);
     console.log(JSON.stringify(await evaluate(cdp, a1)));
@@ -72,10 +89,14 @@ try {
   } else if (cmd === "text") {
     const t = await target(a1 || undefined);
     const cdp = await connect(t.webSocketDebuggerUrl);
-    console.log(await evaluate(cdp, "document.body.innerText"));
+    const raw = await evaluate(cdp, "document.body.innerText");
+    // innerText comes from an uncontrolled page: strip C0 control chars and DEL
+    // (but keep \t \n \r) so a hostile page can't inject terminal escapes or
+    // NULs into an agent's stdout / a downstream parser.
+    console.log(String(raw ?? "").replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, ""));
     cdp.close();
   } else if (cmd === "screenshot") {
-    if (!a1) throw new Error("usage: wsl-cdp-drive screenshot <file> [tabId]");
+    if (!a1) throw new Error("usage: wsl-cdp screenshot FILE [TAB_ID]");
     const t = await target(a2 || undefined);
     const cdp = await connect(t.webSocketDebuggerUrl);
     const { data } = await cdp.send("Page.captureScreenshot", { format: "png" });
@@ -85,11 +106,11 @@ try {
     console.log(`${a1} (${buf.length} bytes, tab ${t.id})`);
     cdp.close();
   } else {
-    console.error("usage: wsl-cdp-drive <eval|text|screenshot> ...");
+    console.error("usage: wsl-cdp <eval|text|screenshot> ...");
     process.exit(2);
   }
   process.exit(0);
 } catch (e) {
-  console.error(`wsl-cdp-drive: ${e.message}`);
+  console.error(`wsl-cdp: ${e.message}`);
   process.exit(1);
 }

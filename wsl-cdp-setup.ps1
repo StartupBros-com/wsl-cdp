@@ -28,7 +28,10 @@ if (-not $IsAdmin) {
   exit
 }
 
-$RuleName = "wsl-cdp bridge"
+# Port-scoped so a second bridge (different WSL_CDP_PROXY_PORT) gets its OWN
+# firewall rule instead of the remove-then-add below silently deleting the
+# first bridge's rule.
+$RuleName = "wsl-cdp bridge ($ProxyPort)"
 
 # 1. stale-rule sweep (both ports, any listen address)
 $lines = netsh interface portproxy show v4tov4 | Select-String "^\s*(\S+)\s+($ProxyPort|$BrowserPort)\s+\S+\s+\S+"

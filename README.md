@@ -18,7 +18,9 @@ wsl-cdp screenshot      # PNG through the agent's eyes
 Log the agent profile into a site once; sessions persist across restarts and reboots.
 
 > [!WARNING]
-> **A CDP debug port is full control of that browser profile.** Any process that can reach `127.0.0.1:9223` in your WSL distro (and any process on Windows that can reach the browser's loopback port) can read and act as every account that profile is logged into. wsl-cdp mitigates by design: the browser only ever listens on loopback, the portproxy is closed to the LAN by a firewall rule scoped to the WSL NAT range, and everything runs in a **dedicated profile**. The mitigation that matters most is still yours: **log the agent profile into only what agents should touch. Never your primary profile, never banking, never anything with irreversible sends.** If you point agents at pages you don't control, treat page content as untrusted input (prompt injection against an authenticated session is the live threat model).
+> **A CDP debug port is full control of that browser profile.** Any process that can reach `127.0.0.1:9223` (and any process on Windows that can reach the browser's loopback port) can read and act as every account that profile is logged into. wsl-cdp mitigates by design: the browser only ever listens on loopback, the portproxy is closed to the LAN by a firewall rule scoped to the WSL NAT range, and everything runs in a **dedicated profile**. The mitigation that matters most is still yours: **log the agent profile into only what agents should touch. Never your primary profile, never banking, never anything with irreversible sends.** If you point agents at pages you don't control, treat page content as untrusted input (prompt injection against an authenticated session is the live threat model).
+>
+> **On a multi-distro machine, "loopback" is shared.** Every WSL2 distro shares one network namespace ([microsoft/WSL#4304](https://github.com/microsoft/WSL/issues/4304), by design), so a process in a *different* distro can reach `127.0.0.1:9223` too — the relay is byte-blind and does not authenticate. The Windows firewall does not isolate co-resident distros, and its NAT-range scope (`172.16.0.0/12`) also admits Docker networks and other hosts in that range. If you run untrusted code in another distro or a container, that is the boundary to think about. `wsl-cdp doctor` warns when it sees other distros installed.
 
 ## Why this exists
 
@@ -53,14 +55,18 @@ Or clone and symlink `wsl-cdp` onto your PATH; the scripts resolve their sibling
 | Command | What it does |
 |---|---|
 | `up` / `down` | bring the chain up (self-healing) / stop the relay |
-| `status` / `doctor` | per-link health, exit code = first broken link, remediation attached |
-| `tabs` / `open URL` / `close ID` | tab management (HTTP CDP endpoints) |
-| `eval JS [TAB]` / `text [TAB]` / `screenshot [FILE] [TAB]` | page access over the WebSocket layer |
+| `status [--json]` / `doctor [--json]` | per-link health, exit code = first broken link, remediation attached; `--json` emits `{ok, exit, checks:[…]}` for scripts |
+| `tabs [--json]` / `open URL` / `close ID` | tab management (HTTP CDP endpoints) |
+| `eval JS [TAB]` / `text [TAB]` / `screenshot [FILE] [TAB]` | page access over the WebSocket layer (needs node ≥ 22) |
 | `print-launch` | show the exact browser command line (port + profile are emitted as a unit) |
 | `setup-windows` | the one elevated step, once; idempotent |
 | `mcp-add` | write a per-repo `.mcp.json` entry for `chrome-devtools-mcp --browserUrl=http://127.0.0.1:9223` |
 
-Environment: `WSL_CDP_PORT` (9223) · `WSL_CDP_PROXY_PORT` (9224) · `WSL_CDP_WINUSER` (autodetected) · `WSL_CDP_BROWSER` (autodetected: Brave → Chrome → Edge).
+`tabs` and `open` print tab-separated rows: `<id>\t<url>` (one page target per line) — pipe to `cut -f1` for ids, `cut -f2` for urls. `tabs --json` gives `[{id, url}, …]` instead.
+
+**Exit codes:** `0` ok · `1` chain/forwarder down (or a CDP call failed after the chain proved healthy) · `2` usage error / invalid argument / unknown flag · `3` end-to-end check failed. Unknown flags and stray arguments are rejected loudly rather than ignored, so a wrong guess never returns a false success.
+
+Environment: `WSL_CDP_PORT` (9223) · `WSL_CDP_PROXY_PORT` (9224) · `WSL_CDP_WINUSER` (autodetected) · `WSL_CDP_BROWSER` (autodetected: Brave → Chrome → Edge) · `WSL_CDP_USERS_ROOT` (`/mnt/c/Users`; override the Windows users root, mainly for tests).
 
 ## How it compares
 

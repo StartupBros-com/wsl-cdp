@@ -4,7 +4,7 @@
 #   curl -fsSL "https://raw.githubusercontent.com/StartupBros-com/wsl-cdp/main/install.sh?$(date +%s)" | bash
 #
 # Flags (pass after `bash -s --`):
-#   --force      reinstall over an existing install
+#   --force      skip the "already installed" note (install always overwrites in place)
 #   --quiet      errors only
 #   --uninstall  remove installed files and symlink
 # Env: WSL_CDP_REF=<branch|tag|sha> (default main), HTTPS_PROXY/HTTP_PROXY honored.
@@ -43,7 +43,7 @@ if [ "$UNINSTALL" = 1 ]; then
   ok "uninstalled ($BIN/wsl-cdp symlink + $DEST removed)"
   info "Windows-side leftovers, remove in elevated PowerShell if desired:"
   info "  netsh interface portproxy delete v4tov4 listenport=9224 listenaddress=0.0.0.0"
-  info "  Remove-NetFirewallRule -DisplayName 'wsl-cdp bridge'"
+  info "  Remove-NetFirewallRule -DisplayName 'wsl-cdp bridge*'   (wildcard: rules are port-scoped)"
   info "  and the agent profile dir %USERPROFILE%\\.wsl-cdp"
   exit 0
 fi
@@ -76,9 +76,12 @@ else
   trap cleanup EXIT
 
   # Pin to a single commit so all four files come from one tree.
+  # `|| true` is load-bearing: under `set -euo pipefail` with pipefail, a failed
+  # `curl -f` (rate limit / offline) makes the whole substitution non-zero and
+  # would abort the script HERE — before the fallback below could ever run.
   SHA="$(curl -fsSL --connect-timeout 10 "${PROXY_ARGS[@]}" \
     "https://api.github.com/repos/$OWNER_REPO/commits/$REF" 2>/dev/null \
-    | jq -r '.sha // empty')"
+    | jq -r '.sha // empty')" || true
   [ -n "$SHA" ] || { warn "could not resolve $REF via GitHub API (rate limit?); falling back to ref-addressed downloads"; SHA="$REF"; }
   info "installing $OWNER_REPO@${SHA:0:12}"
 
