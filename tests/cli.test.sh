@@ -149,12 +149,52 @@ else
   _no "browsers running flags wrong: $bj"
 fi
 
+# --- browsers: a non-executable env override is previewed with a loud WARN
+#     (selected/source document what `up` would use, and `up` would FAIL here)
+b_err="$(WSL_CDP_USERS_ROOT="$fx2/users" WSL_CDP_WINUSER=testuser \
+  WSL_CDP_PROGRAMFILES="$fx2/pf" WSL_CDP_PROGRAMFILES_X86="$fx2/pf86" \
+  HOME="$fx2/home" WSL_CDP_BROWSER="$fx2/nope.exe" \
+  "$CLI" browsers --json 2>&1 >/dev/null)"
+assert_contains "browsers warns on a non-executable override" "$b_err" "not executable"
+
 # --- browsers: zero installs is a loud exit 1, not an empty success
 fx3="$(mktemp -d "${TMPDIR:-/tmp}/wslcdp-none.XXXXXX")"
 mkdir -p "$fx3/users/testuser/AppData/Local/Temp" "$fx3/home"
 assert_exit "browsers with no installs -> 1" 1 env WSL_CDP_USERS_ROOT="$fx3/users" \
   WSL_CDP_WINUSER=testuser WSL_CDP_PROGRAMFILES="$fx3/pf" \
   WSL_CDP_PROGRAMFILES_X86="$fx3/pf86" HOME="$fx3/home" "$CLI" browsers
+
+# --- up over an already-live bridge with WSL_CDP_BROWSER set: the explicit
+#     choice must not be DISCARDED silently (v0.3.2 review blocker). Fake
+#     /json/version server on a scratch port makes up return at step 0 —
+#     nothing is launched, no Windows state is touched.
+srv_port=9345
+python3 - "$srv_port" >/dev/null 2>&1 <<'PY' &
+import http.server, json, sys
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        b = json.dumps({"Browser": "FakeBrowser/1.0"}).encode()
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(b)))
+        self.end_headers()
+        self.wfile.write(b)
+    def log_message(self, *a):
+        pass
+http.server.HTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
+PY
+srv_pid=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  curl -sf -m 1 "http://127.0.0.1:$srv_port/json/version" >/dev/null 2>&1 && break
+  sleep 0.2
+done
+up_err="$(WSL_CDP_PORT=$srv_port WSL_CDP_PROXY_PORT=9346 \
+  WSL_CDP_BROWSER=/mnt/c/fake/browser.exe "$CLI" up 2>&1 >/dev/null)"
+up_rc=$?
+up_out="$(WSL_CDP_PORT=$srv_port WSL_CDP_PROXY_PORT=9346 "$CLI" up 2>/dev/null)"
+kill "$srv_pid" 2>/dev/null
+assert_eq "up over a live bridge exits 0" 0 "$up_rc"
+assert_contains "up warns when the browser override is not applied" "$up_err" "WSL_CDP_BROWSER is set"
+assert_contains "up without an override stays note-free" "$up_out" "bridge up: FakeBrowser"
 
 # --- status --json: valid JSON, documented shape, ok:false when the chain is down
 sj="$(WSL_CDP_PORT=9333 WSL_CDP_PROXY_PORT=9334 "$CLI" status --json 2>/dev/null)"

@@ -163,6 +163,11 @@ cmd_browsers() {
   elif [ -n "$rec" ] && [ "$rec" = "${BROWSER_EXE:-}" ]; then source="recorded"
   fi
   [ -n "${BROWSER_EXE:-}" ] || source="none"
+  # Only an env override can put a non-executable path here (record and
+  # autodetect both check -x): selected/source predict what `up` would use,
+  # and `up` would FAIL on this input — say so instead of previewing success.
+  [ -n "${BROWSER_EXE:-}" ] && [ ! -x "$BROWSER_EXE" ] && \
+    echo "WARN selected browser is not executable: $BROWSER_EXE ('up' would FAIL; fix WSL_CDP_BROWSER)" >&2
   local rows=() c rank=0 name run flags
   while IFS= read -r c; do
     [ -x "$c" ] || continue
@@ -299,6 +304,15 @@ launch_browser() {
   disown
 }
 
+override_note_if_skipped() {
+  # An explicit WSL_CDP_BROWSER choice must never be discarded SILENTLY: when
+  # the chain (or the Windows-side browser) is already serving, up launches
+  # nothing, so the override neither took effect nor got recorded — and browser
+  # identity can't be proven over CDP (Brave reports itself as Chrome/NNN).
+  [ -n "${WSL_CDP_BROWSER:-}" ] || return 0
+  echo "note: WSL_CDP_BROWSER is set, but an agent browser is already serving the bridge — nothing was (re)launched or recorded. To switch browsers: wsl-cdp down, close the agent browser window on Windows, then rerun." >&2
+}
+
 cmd_up() {
   # 0. Already reachable end-to-end? Then we are done — this also covers the
   #    mirrored-networking case (browser reachable at 127.0.0.1:$PORT with no
@@ -306,6 +320,7 @@ cmd_up() {
   local v0
   if v0="$(e2e)"; then
     echo "bridge up: $(printf '%s' "$v0" | jq -r .Browser) at http://127.0.0.1:$PORT"
+    override_note_if_skipped
     return 0
   fi
   # 1. Local port must be free or already ours. Refusing beats fighting:
@@ -325,11 +340,13 @@ cmd_up() {
     return 1
   fi
   # 3. Browser reachable through the portproxy? If not, launch it and wait.
+  local launched=0
   if ! winside >/dev/null; then
     resolve_win || return 1
     [ -n "$BROWSER_EXE" ] && [ -x "$BROWSER_EXE" ] || { echo "FAIL no Chrome/Edge/Brave found (set WSL_CDP_BROWSER=/mnt/c/.../browser.exe)" >&2; return 1; }
     echo "launching $(basename "$BROWSER_EXE") (agent profile $WIN_PROFILE)..."
     launch_browser
+    launched=1
     local i=0
     until winside >/dev/null || [ $i -ge 20 ]; do
       sleep 1; i=$((i+1))
@@ -351,6 +368,15 @@ cmd_up() {
   # 5. Prove the whole chain.
   local v; v="$(e2e)" || { echo "FAIL forwarder up but end-to-end check failed; run wsl-cdp doctor" >&2; return 1; }
   echo "bridge up: $(printf '%s' "$v" | jq -r .Browser) at http://127.0.0.1:$PORT"
+  if [ "$launched" = 1 ]; then
+    # Prove the affinity record landed: launch_browser's write is best-effort
+    # (a 9p hiccup must not block the launch), so a silent miss here would let
+    # a future up autodetect a DIFFERENT vendor onto this logged-in profile.
+    [ "$(cat "$WINHOME/.wsl-cdp/browser" 2>/dev/null)" = "$BROWSER_EXE" ] || \
+      echo "WARN could not record the profile browser at $WINHOME\\.wsl-cdp\\browser — a future 'up' may autodetect a different vendor for this profile. Set WSL_CDP_BROWSER, or write the browser path into that file." >&2
+  else
+    override_note_if_skipped
+  fi
 }
 
 cmd_down() {

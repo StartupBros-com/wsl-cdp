@@ -3,8 +3,10 @@
 # tests/*.test.sh. Requires WSL_CDP_BIN (path to the wsl-cdp CLI).
 #
 # SAFETY: tests only ever exercise the DOWN paths on scratch ports (9333/9334)
-# that nothing listens on. They NEVER invoke up/down/setup-windows/mcp-add and
-# never mutate a live bridge, a firewall, or a portproxy rule.
+# that nothing listens on. They NEVER invoke down/setup-windows/mcp-add and
+# never mutate a live bridge, a firewall, or a portproxy rule. `up` is invoked
+# ONLY against a local fake /json/version server on a scratch port, where it
+# returns at step 0 — before any launch, netsh, or forwarder logic can run.
 set -uo pipefail
 
 WSL_CDP_BIN="${WSL_CDP_BIN:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/wsl-cdp}"
