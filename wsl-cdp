@@ -38,22 +38,32 @@ FWD="$HERE/wsl-cdp-forward.py"
 DRIVE="$HERE/wsl-cdp-drive.mjs"
 
 detect_winuser() {
-  # cmd.exe echoes the session's username; stderr suppressed (UNC-cwd warning).
-  # Interop can be flaky, so fall back to the unique real dir under /mnt/c/Users.
-  local u d cands=()
-  u="$(cmd.exe /c 'echo %USERNAME%' 2>/dev/null | tr -d '\r\n')"
-  if [ -n "$u" ] && [ -d "/mnt/c/Users/$u" ]; then printf '%s' "$u"; return; fi
-  for d in /mnt/c/Users/*/; do
-    d="${d%/}"; d="${d##*/}"
-    case "$d" in Public|Default|"Default User"|"All Users") continue ;; esac
-    cands+=("$d")
+  # Interop (cmd.exe/powershell.exe) can transiently die on WSL vsock errors —
+  # measured on 2026-08-08 with BOTH launchers returning empty for minutes — so
+  # interop is tried first but never trusted to be up:
+  #   1. cmd.exe (x2), then powershell.exe: the authoritative answers.
+  #   2. WSL-username mirror: solo machines usually name both accounts the same.
+  #   3. Freshest AppData/Local/Temp: an actively-used profile writes temp
+  #      constantly. (Registry-hive mtimes are NOT usable for this: the active
+  #      user's NTUSER.DAT is locked and its mtime lags by months through 9p —
+  #      measured picking a sandbox profile over the real user.)
+  local u d i best="" best_t=0 t
+  for i in 1 2; do
+    u="$(cmd.exe /c 'echo %USERNAME%' 2>/dev/null | tr -d '\r\n')"
+    [ -n "$u" ] && [ -d "/mnt/c/Users/$u" ] && { printf '%s' "$u"; return; }
+    sleep 1
   done
-  [ ${#cands[@]} -eq 1 ] && printf '%s' "${cands[0]}"
+  u="$(powershell.exe -NoProfile -Command 'Write-Output $env:USERNAME' 2>/dev/null | tr -d '\r\n')"
+  [ -n "$u" ] && [ -d "/mnt/c/Users/$u" ] && { printf '%s' "$u"; return; }
+  [ -d "/mnt/c/Users/$USER" ] && { printf '%s' "$USER"; return; }
+  for d in /mnt/c/Users/*/; do
+    d="${d%/}"
+    case "${d##*/}" in Public|Default|"Default User"|"All Users") continue ;; esac
+    t="$(stat -c %Y "$d/AppData/Local/Temp" 2>/dev/null || echo 0)"
+    [ "$t" -gt "$best_t" ] && { best="${d##*/}"; best_t="$t"; }
+  done
+  [ -n "$best" ] && printf '%s' "$best"
 }
-
-WINUSER="${WSL_CDP_WINUSER:-$(detect_winuser)}"
-[ -n "$WINUSER" ] || { echo "wsl-cdp: cannot detect the Windows username (multiple profiles under /mnt/c/Users?). Set WSL_CDP_WINUSER." >&2; exit 1; }
-WINHOME="/mnt/c/Users/$WINUSER"
 
 detect_browser() { # first hit wins: Brave (user, system), Chrome (system, user), Edge
   local c
@@ -67,9 +77,29 @@ detect_browser() { # first hit wins: Brave (user, system), Chrome (system, user)
   done
 }
 
-BROWSER_EXE="${WSL_CDP_BROWSER:-$(detect_browser)}"
-WIN_DOT="C:\\Users\\$WINUSER\\.wsl-cdp"
-WIN_PROFILE="$WIN_DOT\\profile"
+# Resolved lazily: only commands that touch the Windows side of the launch/setup
+# path need the username. status/tabs/eval/etc. must keep working when interop
+# is down — hard-failing everything at startup was v0.2.0's bug.
+WINUSER="" WINHOME="" BROWSER_EXE="" WIN_DOT="" WIN_PROFILE=""
+resolve_win() {
+  [ -n "$WINUSER" ] && return 0
+  local cache="$STATE/winuser"
+  WINUSER="${WSL_CDP_WINUSER:-}"
+  if [ -z "$WINUSER" ] && [ -f "$cache" ]; then
+    WINUSER="$(cat "$cache" 2>/dev/null)"
+    [ -d "/mnt/c/Users/$WINUSER" ] || WINUSER=""
+  fi
+  [ -z "$WINUSER" ] && WINUSER="$(detect_winuser)"
+  if [ -z "$WINUSER" ]; then
+    echo "wsl-cdp: cannot detect the Windows username (interop down and no unambiguous /mnt/c/Users profile). Set WSL_CDP_WINUSER." >&2
+    return 1
+  fi
+  mkdir -p "$STATE" && printf '%s' "$WINUSER" >"$cache"
+  WINHOME="/mnt/c/Users/$WINUSER"
+  BROWSER_EXE="${WSL_CDP_BROWSER:-$(detect_browser)}"
+  WIN_DOT="C:\\Users\\$WINUSER\\.wsl-cdp"
+  WIN_PROFILE="$WIN_DOT\\profile"
+}
 
 win_ip() { ip route show default | awk '{print $3; exit}'; }
 
@@ -143,6 +173,7 @@ cmd_up() {
   fi
   # 3. Browser reachable through the portproxy? If not, launch it and wait.
   if ! winside >/dev/null; then
+    resolve_win || return 1
     [ -n "$BROWSER_EXE" ] && [ -x "$BROWSER_EXE" ] || { echo "FAIL no Brave/Chrome/Edge found (set WSL_CDP_BROWSER=/mnt/c/.../browser.exe)" >&2; return 1; }
     echo "launching $(basename "$BROWSER_EXE") (agent profile $WIN_PROFILE)..."
     launch_browser
@@ -190,9 +221,16 @@ cmd_status() {
 cmd_doctor() {
   echo "== wsl-cdp doctor =="
   echo "ports: browser/wsl-listen=$PORT windows-portproxy=$PROXY_PORT"
-  echo "windows-user: $WINUSER (override: WSL_CDP_WINUSER)"
+  # Soft resolve: doctor reports on every link it can and never dies on one.
+  if resolve_win 2>/dev/null; then
+    echo "windows-user: $WINUSER (override: WSL_CDP_WINUSER)"
+  else
+    echo "WARN windows-user  undetected (interop down + ambiguous /mnt/c/Users) — set WSL_CDP_WINUSER; browser check skipped"
+  fi
   echo "networking-mode: $(wslinfo --networking-mode 2>/dev/null || echo unknown) (this bridge assumes NAT; under mirrored you may not need the portproxy)"
-  if [ -n "$BROWSER_EXE" ] && [ -x "$BROWSER_EXE" ]; then echo "ok   browser        $BROWSER_EXE"; else echo "FAIL browser        none of Brave/Chrome/Edge found (set WSL_CDP_BROWSER)"; fi
+  if [ -n "$WINUSER" ]; then
+    if [ -n "$BROWSER_EXE" ] && [ -x "$BROWSER_EXE" ]; then echo "ok   browser        $BROWSER_EXE"; else echo "FAIL browser        none of Brave/Chrome/Edge found (set WSL_CDP_BROWSER)"; fi
+  fi
   local nv; nv="$(node --version 2>/dev/null | tr -dc '0-9.' | cut -d. -f1)"
   [ "${nv:-0}" -ge 22 ] && echo "ok   node           $(node --version) (>=22 needed for eval/screenshot verbs)" || echo "WARN node           ${nv:-none} <22: eval/text/screenshot verbs unavailable"
   local rule; rule="$(portproxy_rule)"
@@ -212,6 +250,7 @@ cmd_doctor() {
 }
 
 cmd_setup_windows() {
+  resolve_win || return 1
   mkdir -p "$WINHOME/.wsl-cdp"
   cp "$HERE/wsl-cdp-setup.ps1" "$WINHOME/.wsl-cdp/wsl-cdp-setup.ps1"
   echo "Triggering elevated Windows setup (UAC prompt on the Windows side)..."
@@ -253,7 +292,8 @@ case "${1:-}" in
   status)        cmd_status ;;
   doctor)        cmd_doctor ;;
   url)           echo "http://127.0.0.1:$PORT" ;;
-  print-launch)  { printf '%s ' "$BROWSER_EXE"; launch_argv | tr '\n' ' '; echo; } ;;
+  print-launch)  resolve_win || exit 1
+                 { printf '%s ' "$BROWSER_EXE"; launch_argv | tr '\n' ' '; echo; } ;;
   tabs)          need_chain; curl -sf -m 5 "http://127.0.0.1:$PORT/json/list" | jq -r '.[] | select(.type=="page") | [.id, .url] | @tsv' ;;
   open)          need_chain; u="$(jq -rn --arg u "${2:?usage: wsl-cdp open URL}" '$u|@uri')"
                  curl -sf -m 10 -X PUT "http://127.0.0.1:$PORT/json/new?$u" | jq -r '[.id, .url] | @tsv' ;;
