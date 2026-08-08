@@ -46,7 +46,7 @@ Each of these is a silent failure if you wire the bridge by hand:
 curl -fsSL https://raw.githubusercontent.com/StartupBros-com/wsl-cdp/main/install.sh | bash
 ```
 
-Or clone and symlink `wsl-cdp` onto your PATH; the scripts resolve their siblings via their own location. Requirements: WSL2 (NAT networking), `jq`, `python3` (stdlib only), node ≥ 22 for the `eval`/`text`/`screenshot` verbs (built-in WebSocket; no npm installs).
+Or clone and symlink `wsl-cdp` onto your PATH; the scripts resolve their siblings via their own location. Claude Code users can instead install the plugin (skill + guided `/wsl-cdp:setup`) from the [House of Vibe marketplace](https://github.com/StartupBros-com/hov-marketplace): `/plugin marketplace add StartupBros-com/hov-marketplace`, then `/plugin install wsl-cdp@hov`. Requirements: WSL2 (NAT networking), `jq`, `python3` (stdlib only), node ≥ 22 for the `eval`/`text`/`screenshot` verbs (built-in WebSocket; no npm installs).
 
 ## Commands
 

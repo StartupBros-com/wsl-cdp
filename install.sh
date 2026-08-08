@@ -60,25 +60,37 @@ if [ -e "$DEST/wsl-cdp" ] && [ "$FORCE" != 1 ]; then
   info "already installed at $DEST — reinstalling from $REF (use --force to silence this note)"
 fi
 
-TMP="$(mktemp -d)"
-cleanup() { rm -rf "$TMP"; }
-trap cleanup EXIT
+# Local mode: when the scripts sit beside this installer (git clone or Claude
+# Code plugin cache), install from them directly — no network, no tear risk.
+# Piped `curl | bash` has no usable BASH_SOURCE, so it falls through to download.
+SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-/dev/null}")" 2>/dev/null && pwd || true)"
+LOCAL=1
+for f in "${FILES[@]}"; do [ -f "$SRC_DIR/$f" ] || { LOCAL=0; break; }; done
 
-# Pin to a single commit so all four files come from one tree.
-SHA="$(curl -fsSL --connect-timeout 10 "${PROXY_ARGS[@]}" \
-  "https://api.github.com/repos/$OWNER_REPO/commits/$REF" 2>/dev/null \
-  | jq -r '.sha // empty')"
-[ -n "$SHA" ] || { warn "could not resolve $REF via GitHub API (rate limit?); falling back to ref-addressed downloads"; SHA="$REF"; }
-info "installing $OWNER_REPO@${SHA:0:12}"
+if [ "$LOCAL" = 1 ]; then
+  info "installing from local files in $SRC_DIR"
+  for f in "${FILES[@]}"; do install -m 0755 "$SRC_DIR/$f" "$DEST/$f"; done
+else
+  TMP="$(mktemp -d)"
+  cleanup() { rm -rf "$TMP"; }
+  trap cleanup EXIT
 
-for f in "${FILES[@]}"; do
-  curl -fsSL "${PROXY_ARGS[@]}" \
-    "https://raw.githubusercontent.com/$OWNER_REPO/$SHA/$f" -o "$TMP/$f" \
-    || { err "download failed: $f"; exit 1; }
-  [ -s "$TMP/$f" ] || { err "downloaded $f is empty"; exit 1; }
-done
+  # Pin to a single commit so all four files come from one tree.
+  SHA="$(curl -fsSL --connect-timeout 10 "${PROXY_ARGS[@]}" \
+    "https://api.github.com/repos/$OWNER_REPO/commits/$REF" 2>/dev/null \
+    | jq -r '.sha // empty')"
+  [ -n "$SHA" ] || { warn "could not resolve $REF via GitHub API (rate limit?); falling back to ref-addressed downloads"; SHA="$REF"; }
+  info "installing $OWNER_REPO@${SHA:0:12}"
 
-for f in "${FILES[@]}"; do install -m 0755 "$TMP/$f" "$DEST/$f"; done
+  for f in "${FILES[@]}"; do
+    curl -fsSL "${PROXY_ARGS[@]}" \
+      "https://raw.githubusercontent.com/$OWNER_REPO/$SHA/$f" -o "$TMP/$f" \
+      || { err "download failed: $f"; exit 1; }
+    [ -s "$TMP/$f" ] || { err "downloaded $f is empty"; exit 1; }
+  done
+
+  for f in "${FILES[@]}"; do install -m 0755 "$TMP/$f" "$DEST/$f"; done
+fi
 ln -sf "$DEST/wsl-cdp" "$BIN/wsl-cdp"
 ok "installed to $DEST (entry: $BIN/wsl-cdp)"
 
