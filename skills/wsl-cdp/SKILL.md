@@ -1,6 +1,6 @@
 ---
 name: wsl-cdp
-description: Drive the user's real, logged-in Windows browser (Brave, Chrome, or Edge) from a Claude Code session running inside WSL2, over the Chrome DevTools Protocol - read authenticated dashboards and consoles, take real screenshots, open and read pages with the user's sessions. Use when a task needs the user's existing web logins and the session runs in WSL2, where the Claude in Chrome extension cannot work. Not for native-Windows or macOS Claude Code (use the official Claude in Chrome extension), not for anonymous scraping or CI (use headless Playwright inside WSL), not for getting past login walls (those are handed to the human).
+description: Drive the user's real, logged-in Windows browser (Chrome, Edge, or Brave) from a Claude Code session running inside WSL2, over the Chrome DevTools Protocol - read authenticated dashboards and consoles, take real screenshots, open and read pages with the user's sessions. Use when a task needs the user's existing web logins and the session runs in WSL2, where the Claude in Chrome extension cannot work. Not for native-Windows or macOS Claude Code (use the official Claude in Chrome extension), not for anonymous scraping or CI (use headless Playwright inside WSL), not for getting past login walls (those are handed to the human).
 ---
 
 # wsl-cdp: the user's real Windows browser, from WSL2

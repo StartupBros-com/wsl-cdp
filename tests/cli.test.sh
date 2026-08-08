@@ -46,6 +46,23 @@ assert_eq "print-launch exits 0" 0 "$rc"
 assert_contains "print-launch carries the debug port" "$argv" "--remote-debugging-port=9333"
 assert_contains "print-launch pairs the dedicated profile" "$argv" 'user-data-dir=C:\Users\testuser\.wsl-cdp\profile'
 
+# --- launch argv suppresses updater/background churn (v0.3.1: a fresh agent
+#     profile must not kick off update checks; Brave's relaunch loop)
+assert_contains "argv disables background networking" "$argv" "--disable-background-networking"
+assert_contains "argv disables the Brave updater" "$argv" "--disable-brave-update"
+assert_contains "argv stretches the component-update interval" "$argv" "--component-update-interval-in-sec="
+
+# --- autodetect order: Chrome > Edge > Brave (v0.3.1: Brave last — its updater
+#     contends with a daily-driver Brave over the shared versioned install)
+detect_argv(){ WSL_CDP_USERS_ROOT="$fx/users" WSL_CDP_WINUSER=testuser \
+  WSL_CDP_PROGRAMFILES="$fx/pf" WSL_CDP_PROGRAMFILES_X86="$fx/pf86" \
+  HOME="$fx/home" "$CLI" print-launch 2>/dev/null; }
+assert_contains "autodetect prefers Chrome when all three exist" "$(detect_argv)" "chrome.exe"
+rm "$(fixture_chrome "$fx")"
+assert_contains "autodetect falls back to Edge without Chrome" "$(detect_argv)" "msedge.exe"
+rm "$(fixture_edge "$fx")"
+assert_contains "autodetect falls back to Brave last" "$(detect_argv)" "brave.exe"
+
 # --- a WSL_CDP_WINUSER override must NOT persist into the winuser cache
 h="$fx/home2"
 WSL_CDP_USERS_ROOT="$fx/users" WSL_CDP_WINUSER=testuser \

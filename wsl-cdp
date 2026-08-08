@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # wsl-cdp — let AI agents (or you) in WSL2 drive a REAL, logged-in Windows
-# browser (Brave/Chrome/Edge) over the Chrome DevTools Protocol.
+# browser (Chrome/Edge/Brave) over the Chrome DevTools Protocol.
 #
 # Why this exists: extension-based agent-browser integrations (e.g. Claude in
 # Chrome) ride a native messaging host — the browser spawns the CLI as a child
@@ -81,14 +81,22 @@ detect_winuser() {
   [ -n "$best" ] && printf '%s' "$best"
 }
 
-detect_browser() { # first hit wins: Brave (user, system), Chrome (system, user), Edge
+detect_browser() { # first hit wins: Chrome (system, user), Edge (x86, 64-bit), Brave (user, system)
+  # Chrome/Edge outrank Brave (v0.3.1): Chrome is the most common install and
+  # Edge ships on every Windows box, so a stock machine works with zero config.
+  # Brave is LAST because its updater stages a versioned-install swap that can
+  # only complete when no brave.exe runs — when Brave is also the operator's
+  # daily browser, the agent instance relaunch-loops on "update pending"
+  # (--user-data-dir isolates the profile, not the shared install). Brave still
+  # works when it is the only browser, or pinned via WSL_CDP_BROWSER.
   local c
   for c in \
-    "$WINHOME/AppData/Local/BraveSoftware/Brave-Browser/Application/brave.exe" \
-    "$PROGRAMFILES/BraveSoftware/Brave-Browser/Application/brave.exe" \
     "$PROGRAMFILES/Google/Chrome/Application/chrome.exe" \
     "$WINHOME/AppData/Local/Google/Chrome/Application/chrome.exe" \
-    "$PROGRAMFILES_X86/Microsoft/Edge/Application/msedge.exe"; do
+    "$PROGRAMFILES_X86/Microsoft/Edge/Application/msedge.exe" \
+    "$PROGRAMFILES/Microsoft/Edge/Application/msedge.exe" \
+    "$WINHOME/AppData/Local/BraveSoftware/Brave-Browser/Application/brave.exe" \
+    "$PROGRAMFILES/BraveSoftware/Brave-Browser/Application/brave.exe"; do
     [ -x "$c" ] && { printf '%s' "$c"; return; }
   done
 }
@@ -125,12 +133,21 @@ win_ip() { ip route show default | awk '{print $3; exit}'; }
 launch_argv() {
   # --remote-debugging-port and --user-data-dir are a UNIT: Chromium 136+
   # silently ignores the former without the latter. Do not split them.
+  # The last three suppress updater/background churn on a fresh agent profile.
+  # --disable-brave-update and the component-update interval are Brave switches
+  # (harmless elsewhere: Chromium ignores unknown switches); the generic
+  # --check-for-update-interval is a no-op on modern Chromium. NOTE these can't
+  # finish an update the OS-side updater has already staged — that needs every
+  # instance of that browser closed once (README: Brave update loop).
   printf '%s\n' \
     "--remote-debugging-port=$PORT" \
     "--user-data-dir=$WIN_PROFILE" \
     "--remote-allow-origins=*" \
     "--no-first-run" \
-    "--no-default-browser-check"
+    "--no-default-browser-check" \
+    "--disable-background-networking" \
+    "--disable-brave-update" \
+    "--component-update-interval-in-sec=31536000"
 }
 
 listener_of() { # listener_of PORT -> "pid comm" of any local listener, empty if none
@@ -202,7 +219,7 @@ cmd_up() {
   # 3. Browser reachable through the portproxy? If not, launch it and wait.
   if ! winside >/dev/null; then
     resolve_win || return 1
-    [ -n "$BROWSER_EXE" ] && [ -x "$BROWSER_EXE" ] || { echo "FAIL no Brave/Chrome/Edge found (set WSL_CDP_BROWSER=/mnt/c/.../browser.exe)" >&2; return 1; }
+    [ -n "$BROWSER_EXE" ] && [ -x "$BROWSER_EXE" ] || { echo "FAIL no Chrome/Edge/Brave found (set WSL_CDP_BROWSER=/mnt/c/.../browser.exe)" >&2; return 1; }
     echo "launching $(basename "$BROWSER_EXE") (agent profile $WIN_PROFILE)..."
     launch_browser
     local i=0
@@ -318,7 +335,7 @@ cmd_doctor() {
   fi
   echo "networking-mode: $(wslinfo --networking-mode 2>/dev/null || echo unknown) (this bridge assumes NAT; under mirrored you may not need the portproxy)"
   if [ -n "$WINUSER" ]; then
-    if [ -n "$BROWSER_EXE" ] && [ -x "$BROWSER_EXE" ]; then echo "ok   browser        $BROWSER_EXE"; else echo "FAIL browser        none of Brave/Chrome/Edge found (set WSL_CDP_BROWSER)"; fi
+    if [ -n "$BROWSER_EXE" ] && [ -x "$BROWSER_EXE" ]; then echo "ok   browser        $BROWSER_EXE"; else echo "FAIL browser        none of Chrome/Edge/Brave found (set WSL_CDP_BROWSER)"; fi
   fi
   local nv; nv="$(node --version 2>/dev/null | tr -dc '0-9.' | cut -d. -f1)"
   [ "${nv:-0}" -ge 22 ] && echo "ok   node           $(node --version) (>=22 needed for eval/screenshot verbs)" || echo "WARN node           ${nv:-none} <22: eval/text/screenshot verbs unavailable"
