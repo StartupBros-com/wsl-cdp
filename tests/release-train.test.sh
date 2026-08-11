@@ -113,7 +113,7 @@ if effective_permissions != {"contents": "read", "id-token": "write"}:
 PY
 }
 
-python3 - "$WORKFLOW" "$TMP" "$HARDENED_SHA" "$RETIRED_SHA" <<'PY'
+if ! python3 - "$WORKFLOW" "$TMP" "$HARDENED_SHA" "$RETIRED_SHA" <<'PY'
 import sys
 from pathlib import Path
 
@@ -166,16 +166,39 @@ decoy_jobs = (
     encoding="utf-8",
 )
 PY
+then
+  printf 'fixture generation failed\n' >&2
+  exit 1
+fi
+
+for fixture in retired decoy missing-edited shadowed-permissions; do
+  [[ -s "$TMP/$fixture.yml" ]] || {
+    printf 'missing generated fixture: %s\n' "$fixture.yml" >&2
+    exit 1
+  }
+done
+
+assert_policy_failure() { # label diagnostic fixture
+  local label="$1" diagnostic="$2" fixture="$3" output status
+  output="$(validate_release_train "$fixture" 2>&1)"
+  status=$?
+  if [[ "$status" -eq 1 && "$output" == *"$diagnostic"* ]]; then
+    _ok "$label"
+  else
+    _no "$label (expected exit 1 with [$diagnostic], got exit $status and [$output])"
+  fi
+}
 
 assert_exit "current release train satisfies hardened policy" 0 \
   validate_release_train "$WORKFLOW"
-assert_exit "retired workflow pin is rejected" 1 \
-  validate_release_train "$TMP/retired.yml"
-assert_exit "comment and unrelated-job decoys cannot bless announce" 1 \
-  validate_release_train "$TMP/decoy.yml"
-assert_exit "missing edited trigger is rejected" 1 \
-  validate_release_train "$TMP/missing-edited.yml"
-assert_exit "job-level permission shadowing is rejected" 1 \
-  validate_release_train "$TMP/shadowed-permissions.yml"
+assert_policy_failure "retired workflow pin is rejected" \
+  "retired announce workflow SHA remains" "$TMP/retired.yml"
+assert_policy_failure "comment and unrelated-job decoys cannot bless announce" \
+  "jobs.announce.uses is not the hardened immutable workflow" "$TMP/decoy.yml"
+assert_policy_failure "missing edited trigger is rejected" \
+  "release types must be exactly published and edited" "$TMP/missing-edited.yml"
+assert_policy_failure "job-level permission shadowing is rejected" \
+  "effective announce permissions must be exactly contents: read and id-token: write" \
+  "$TMP/shadowed-permissions.yml"
 
 t_summary
