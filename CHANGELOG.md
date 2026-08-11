@@ -2,6 +2,10 @@
 
 All notable changes to wsl-cdp. Format follows [Keep a Changelog](https://keepachangelog.com/); versions are [GitHub releases](https://github.com/StartupBros-com/wsl-cdp/releases).
 
+## [0.3.5] — 2026-08-11
+
+**Tool Drop announcement wiring repaired.** The root `VERSION` file now travels with the release tree, so the shared OIDC release train can verify `VERSION == plugin.json == tag` before posting the marketplace card to Discord. v0.3.4 targeted a commit from before both the release-train workflow and `VERSION` existed, so no release event ever ran.
+
 ## [0.3.4] — 2026-08-08
 
 **Interop-outage immunity + the `upload` verb.** Born from a live outage: WSL's vsock interop wedged mid-session (`accept4 failed 110`), hanging `setup-windows` past 300 s and misleading `doctor` into a "no portproxy rule" verdict.
