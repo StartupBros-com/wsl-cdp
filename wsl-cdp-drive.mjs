@@ -83,14 +83,12 @@ async function evaluate(cdp, expression) {
   return r.result.value;
 }
 
-async function withCdp(tabId, operation) {
+async function withCdp(tabId, action) {
   const t = await target(tabId);
   const cdp = await connect(t.webSocketDebuggerUrl);
-  try {
-    return await operation(cdp, t);
-  } finally {
-    cdp.close();
-  }
+  const result = await action(cdp, t);
+  cdp.close();
+  return result;
 }
 
 const [cmd, a1, a2, a3] = process.argv.slice(2);
