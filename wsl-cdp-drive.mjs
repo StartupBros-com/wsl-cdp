@@ -83,52 +83,58 @@ async function evaluate(cdp, expression) {
   return r.result.value;
 }
 
+async function withCdp(tabId, operation) {
+  const t = await target(tabId);
+  const cdp = await connect(t.webSocketDebuggerUrl);
+  try {
+    return await operation(cdp, t);
+  } finally {
+    cdp.close();
+  }
+}
+
 const [cmd, a1, a2, a3] = process.argv.slice(2);
 try {
   if (cmd === "eval") {
     if (!a1) throw new Error("usage: wsl-cdp eval JS [TAB_ID]");
-    const t = await target(a2 || undefined);
-    const cdp = await connect(t.webSocketDebuggerUrl);
-    console.log(JSON.stringify(await evaluate(cdp, a1)));
-    cdp.close();
+    await withCdp(a2 || undefined, async (cdp) => {
+      console.log(JSON.stringify(await evaluate(cdp, a1)));
+    });
   } else if (cmd === "text") {
-    const t = await target(a1 || undefined);
-    const cdp = await connect(t.webSocketDebuggerUrl);
-    const raw = await evaluate(cdp, "document.body.innerText");
-    // innerText comes from an uncontrolled page: strip C0 control chars and DEL
-    // (but keep \t \n \r) so a hostile page can't inject terminal escapes or
-    // NULs into an agent's stdout / a downstream parser.
-    console.log(String(raw ?? "").replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, ""));
-    cdp.close();
+    await withCdp(a1 || undefined, async (cdp) => {
+      const raw = await evaluate(cdp, "document.body.innerText");
+      // innerText comes from an uncontrolled page: strip C0 control chars and DEL
+      // (but keep \t \n \r) so a hostile page can't inject terminal escapes or
+      // NULs into an agent's stdout / a downstream parser.
+      console.log(String(raw ?? "").replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, ""));
+    });
   } else if (cmd === "screenshot") {
     if (!a1) throw new Error("usage: wsl-cdp screenshot FILE [TAB_ID]");
-    const t = await target(a2 || undefined);
-    const cdp = await connect(t.webSocketDebuggerUrl);
-    const { data } = await cdp.send("Page.captureScreenshot", { format: "png" });
-    const { writeFileSync } = await import("node:fs");
-    const buf = Buffer.from(data, "base64");
-    writeFileSync(a1, buf);
-    console.log(`${a1} (${buf.length} bytes, tab ${t.id})`);
-    cdp.close();
+    await withCdp(a2 || undefined, async (cdp, t) => {
+      const { data } = await cdp.send("Page.captureScreenshot", { format: "png" });
+      const { writeFileSync } = await import("node:fs");
+      const buf = Buffer.from(data, "base64");
+      writeFileSync(a1, buf);
+      console.log(`${a1} (${buf.length} bytes, tab ${t.id})`);
+    });
   } else if (cmd === "upload") {
     if (!a1 || !a2) throw new Error("usage: wsl-cdp upload FILE SELECTOR [TAB_ID]");
-    const t = await target(a3 || undefined);
-    const cdp = await connect(t.webSocketDebuggerUrl);
-    await cdp.send("DOM.enable");
-    const { root } = await cdp.send("DOM.getDocument", { depth: 1 });
-    const { nodeId } = await cdp.send("DOM.querySelector", { nodeId: root.nodeId, selector: a2 });
-    if (!nodeId) throw new Error(`no element matches selector: ${a2}`);
-    await cdp.send("DOM.setFileInputFiles", { files: [a1], nodeId });
-    // setFileInputFiles alone does not reliably fire the page's own handlers
-    // (measured against GitHub's social-preview uploader): dispatch input +
-    // change on the same selector so uploader JS reacts.
-    await evaluate(cdp, `(() => {
-      const el = document.querySelector(${JSON.stringify(a2)});
-      el.dispatchEvent(new Event("input", { bubbles: true }));
-      el.dispatchEvent(new Event("change", { bubbles: true }));
-      return true; })()`);
-    console.log(`upload set: ${a1} -> ${a2} (tab ${t.id}); the page's own uploader takes it from here`);
-    cdp.close();
+    await withCdp(a3 || undefined, async (cdp, t) => {
+      await cdp.send("DOM.enable");
+      const { root } = await cdp.send("DOM.getDocument", { depth: 1 });
+      const { nodeId } = await cdp.send("DOM.querySelector", { nodeId: root.nodeId, selector: a2 });
+      if (!nodeId) throw new Error(`no element matches selector: ${a2}`);
+      await cdp.send("DOM.setFileInputFiles", { files: [a1], nodeId });
+      // setFileInputFiles alone does not reliably fire the page's own handlers
+      // (measured against GitHub's social-preview uploader): dispatch input +
+      // change on the same selector so uploader JS reacts.
+      await evaluate(cdp, `(() => {
+        const el = document.querySelector(${JSON.stringify(a2)});
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+        el.dispatchEvent(new Event("change", { bubbles: true }));
+        return true; })()`);
+      console.log(`upload set: ${a1} -> ${a2} (tab ${t.id}); the page's own uploader takes it from here`);
+    });
   } else {
     console.error("usage: wsl-cdp <eval|text|screenshot|upload> ...");
     process.exit(2);
