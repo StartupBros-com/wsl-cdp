@@ -69,7 +69,7 @@ for f in "${FILES[@]}"; do [ -f "$SRC_DIR/$f" ] || { LOCAL=0; break; }; done
 
 if [ "$LOCAL" = 1 ]; then
   info "installing from local files in $SRC_DIR"
-  for f in "${FILES[@]}"; do install -m 0755 "$SRC_DIR/$f" "$DEST/$f"; done
+  INSTALL_SOURCE="$SRC_DIR"
 else
   TMP="$(mktemp -d)"
   cleanup() { rm -rf "$TMP"; }
@@ -91,9 +91,10 @@ else
       || { err "download failed: $f"; exit 1; }
     [ -s "$TMP/$f" ] || { err "downloaded $f is empty"; exit 1; }
   done
-
-  for f in "${FILES[@]}"; do install -m 0755 "$TMP/$f" "$DEST/$f"; done
+  INSTALL_SOURCE="$TMP"
 fi
+
+for f in "${FILES[@]}"; do install -m 0755 "$INSTALL_SOURCE/$f" "$DEST/$f"; done
 ln -sf "$DEST/wsl-cdp" "$BIN/wsl-cdp"
 ok "installed to $DEST (entry: $BIN/wsl-cdp)"
 
