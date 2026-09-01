@@ -304,13 +304,25 @@ assert_contains "up without an override stays note-free" "$up_out" "bridge up: F
 # --- interop-outage immunity (v0.3.4): a wedged vsock channel HANGS Windows
 #     exes instead of failing them; every verb must survive via win_exec
 #     timeouts and say the true thing instead of misdiagnosing
+# The PATH-held exe shims are the established interop seam. Retain one real
+# sleep under win_exec in the text doctor: it has the broadest public contract
+# (survival, diagnostic, and no false netsh conclusion). The other callers need
+# only the documented timeout result: empty output with status 124.
 fx5="$(make_fixture)"
-mkdir -p "$fx5/hang"
+fixture_log="$fx5/interop-timeout-calls"
+mkdir -p "$fx5/hang" "$fx5/timed-out"
 for exe in cmd.exe netsh.exe powershell.exe tasklist.exe wsl.exe; do
-  printf '#!/usr/bin/env bash\nsleep 60\n' >"$fx5/hang/$exe"
-  chmod +x "$fx5/hang/$exe"
+  printf '%s\n' '#!/usr/bin/env bash' \
+    'printf "real:%s\n" "$WSL_CDP_TIMEOUT_FIXTURE_CASE" >>"$WSL_CDP_TIMEOUT_FIXTURE_LOG"' \
+    'sleep 60' >"$fx5/hang/$exe"
+  printf '%s\n' '#!/usr/bin/env bash' \
+    'printf "deterministic:%s\n" "$WSL_CDP_TIMEOUT_FIXTURE_CASE" >>"$WSL_CDP_TIMEOUT_FIXTURE_LOG"' \
+    'exit 124' >"$fx5/timed-out/$exe"
+  chmod +x "$fx5/hang/$exe" "$fx5/timed-out/$exe"
 done
-doc_out="$(WSL_CDP_WIN_EXEC_TIMEOUT=1 PATH="$fx5/hang:$PATH" \
+doc_out="$(WSL_CDP_TIMEOUT_FIXTURE_CASE=doctor \
+  WSL_CDP_TIMEOUT_FIXTURE_LOG="$fixture_log" \
+  WSL_CDP_WIN_EXEC_TIMEOUT=1 PATH="$fx5/hang:$PATH" \
   WSL_CDP_USERS_ROOT="$fx5/users" WSL_CDP_WINUSER=testuser HOME="$fx5/home" \
   WSL_CDP_PORT=9333 WSL_CDP_PROXY_PORT=9334 timeout 60 "$CLI" doctor 2>&1)"
 doc_rc=$?
@@ -319,7 +331,9 @@ assert_contains "doctor names the interop outage" "$doc_out" "WARN interop"
 assert_contains "doctor refuses the no-rule misread" "$doc_out" "unverifiable: interop down"
 case "$doc_out" in *"no v4tov4 rule"*) _no "doctor still claims no-rule under dead netsh" ;; *) _ok "no false no-rule claim under dead netsh" ;; esac
 
-up_err2="$(WSL_CDP_WIN_EXEC_TIMEOUT=1 PATH="$fx5/hang:$PATH" \
+up_err2="$(WSL_CDP_TIMEOUT_FIXTURE_CASE=up-rescue \
+  WSL_CDP_TIMEOUT_FIXTURE_LOG="$fixture_log" \
+  WSL_CDP_WIN_EXEC_TIMEOUT=1 PATH="$fx5/timed-out:$PATH" \
   WSL_CDP_USERS_ROOT="$fx5/users" WSL_CDP_WINUSER=testuser HOME="$fx5/home" \
   WSL_CDP_PORT=9333 WSL_CDP_PROXY_PORT=9334 timeout 60 "$CLI" up 2>&1 >/dev/null)"
 up_rc2=$?
@@ -347,7 +361,9 @@ assert_exit "upload missing file -> 2" 2 "$CLI" upload /nonexistent-file.png "in
 #     honest rescue without a resolvable user, staged-upload hygiene
 assert_exit "WIN_EXEC_TIMEOUT=abc -> 2" 2 env WSL_CDP_WIN_EXEC_TIMEOUT=abc "$CLI" url
 
-dj="$(WSL_CDP_WIN_EXEC_TIMEOUT=1 PATH="$fx5/hang:$PATH" \
+dj="$(WSL_CDP_TIMEOUT_FIXTURE_CASE=doctor-json \
+  WSL_CDP_TIMEOUT_FIXTURE_LOG="$fixture_log" \
+  WSL_CDP_WIN_EXEC_TIMEOUT=1 PATH="$fx5/timed-out:$PATH" \
   WSL_CDP_USERS_ROOT="$fx5/users" WSL_CDP_WINUSER=testuser HOME="$fx5/home" \
   WSL_CDP_PORT=9333 WSL_CDP_PROXY_PORT=9334 timeout 60 "$CLI" doctor --json 2>/dev/null)"
 if printf '%s' "$dj" | jq -e '.env.interop == false' >/dev/null 2>&1; then
@@ -359,7 +375,9 @@ fi
 # gated wedge latency: pre-gate code took >=16s at a 2s timeout (3x netsh retry
 # + wsl.exe + stale netsh each independently re-probed); gated must stay well under
 wedge_s=$(date +%s)
-WSL_CDP_WIN_EXEC_TIMEOUT=2 PATH="$fx5/hang:$PATH" \
+WSL_CDP_TIMEOUT_FIXTURE_CASE=gated-latency \
+  WSL_CDP_TIMEOUT_FIXTURE_LOG="$fixture_log" \
+  WSL_CDP_WIN_EXEC_TIMEOUT=2 PATH="$fx5/timed-out:$PATH" \
   WSL_CDP_USERS_ROOT="$fx5/users" WSL_CDP_WINUSER=testuser HOME="$fx5/home" \
   WSL_CDP_PORT=9333 WSL_CDP_PROXY_PORT=9334 timeout 60 "$CLI" doctor >/dev/null 2>&1
 wedge_e=$(date +%s)
@@ -371,11 +389,16 @@ fi
 
 # rescue with NO resolvable Windows user: must not name a file it never staged
 mkdir -p "$fx5/empty-users"
-resc="$(WSL_CDP_WIN_EXEC_TIMEOUT=1 PATH="$fx5/hang:$PATH" \
+resc="$(WSL_CDP_TIMEOUT_FIXTURE_CASE=unresolvable-user \
+  WSL_CDP_TIMEOUT_FIXTURE_LOG="$fixture_log" \
+  WSL_CDP_WIN_EXEC_TIMEOUT=1 PATH="$fx5/timed-out:$PATH" \
   WSL_CDP_USERS_ROOT="$fx5/empty-users" HOME="$fx5/home2" \
   WSL_CDP_PORT=9333 WSL_CDP_PROXY_PORT=9334 timeout 60 "$CLI" up 2>&1 >/dev/null)"
 assert_contains "unresolvable-user rescue says copy-it-yourself" "$resc" "copy "
 case "$resc" in *'C:\Users\<you>'*) _no "rescue still prints a placeholder staged path" ;; *) _ok "no phantom staged-script path" ;; esac
+assert_eq "one real and four deterministic timeout fixtures run in order" \
+  "real:doctor,deterministic:up-rescue,deterministic:doctor-json,deterministic:gated-latency,deterministic:unresolvable-user" \
+  "$(paste -sd, "$fixture_log")"
 
 # staged uploads are cleared by harden and flagged by nothing afterwards
 mkdir -p "$fx4/users/testuser/.wsl-cdp/uploads"
