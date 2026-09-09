@@ -135,7 +135,7 @@ def replace_once(text: str, old: str, new: str) -> str:
 announce_line = (
     "  announce:\n"
     "    uses: StartupBros-com/hov-marketplace/.github/workflows/"
-    f"hov-tool-drop-announce.yml@{hardened_sha} # fix: bind Tool Drop intent to the promoted release"
+    f"hov-tool-drop-announce.yml@{hardened_sha} # fix: retry the promotion-propagation 403"
 )
 decoy_jobs = (
     "  decoy:\n"
