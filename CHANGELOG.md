@@ -2,6 +2,13 @@
 
 All notable changes to wsl-cdp. Format follows [Keep a Changelog](https://keepachangelog.com/); versions are [GitHub releases](https://github.com/StartupBros-com/wsl-cdp/releases).
 
+## [0.3.6] — 2026-09-26
+
+**Hardened Tool Drop pin in a released tree.** Release workflows run from the tag's tree, so v0.3.5 still announced through the retired marketplace workflow even after `main` moved to the hardened OIDC train. This release carries the pin (StartupBros-com/pushbot#1559).
+
+- `release-train.yml` pins the hardened announce workflow with the promotion-lag 403 retry; releases are auto-tagged, staged as drafts, and published once the marketplace card repins (hov-marketplace pattern).
+- CDP session lifecycle and the installer copy loop are shared helpers; redundant timeout fixtures compressed.
+
 ## [0.3.5] — 2026-08-11
 
 **Tool Drop announcement wiring repaired.** The root `VERSION` file now travels with the release tree, so the shared OIDC release train can verify `VERSION == plugin.json == tag` before posting the marketplace card to Discord. v0.3.4 targeted a commit from before both the release-train workflow and `VERSION` existed, so no release event ever ran.
