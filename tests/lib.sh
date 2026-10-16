@@ -58,3 +58,17 @@ fixture_rank(){
 }
 fixture_brave(){ printf '%s' "$1/users/testuser/AppData/Local/BraveSoftware/Brave-Browser/Application/brave.exe"; }
 fixture_chrome(){ printf '%s' "$1/pf/Google/Chrome/Application/chrome.exe"; }
+
+# Create a synthetic login store; URL arguments select the rows for each case.
+# Keep schema and dummy credentials identical across the hygiene regressions.
+fixture_login_store(){
+  python3 - "$@" <<'PYTHON'
+import os, sqlite3, sys
+os.makedirs(os.path.dirname(sys.argv[1]), exist_ok=True)
+c = sqlite3.connect(sys.argv[1])
+c.execute("create table logins (origin_url text, username_value text, password_value blob)")
+for origin in sys.argv[2:]:
+    c.execute("insert into logins values (?, 'will', x'00')", (origin,))
+c.commit(); c.close()
+PYTHON
+}
