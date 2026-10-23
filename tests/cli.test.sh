@@ -199,27 +199,14 @@ else
   _no "harden clobbered Preferences: $(cat "$prefs" 2>/dev/null)"
 fi
 
-python3 - "$pdefault/Login Data" <<'PY'
-import os, sqlite3, sys
-os.makedirs(os.path.dirname(sys.argv[1]), exist_ok=True)
-c = sqlite3.connect(sys.argv[1])
-c.execute("create table logins (origin_url text, username_value text, password_value blob)")
-c.execute("insert into logins values ('https://github.com','will',x'00')")
-c.execute("insert into logins values ('https://example.com','will',x'00')")
-c.commit(); c.close()
-PY
+fixture_login_store "$pdefault/Login Data" "https://github.com" "https://example.com"
 touch "$pdefault/Cookies"
 h_out="$(harden_run)"
 assert_contains "harden scrubs and counts saved passwords" "$h_out" "scrubbed 2 saved password"
 if [ -f "$pdefault/Login Data" ]; then _no "Login Data survived the scrub"; else _ok "Login Data removed by the scrub"; fi
 if [ -f "$pdefault/Cookies" ]; then _ok "Cookies (sessions) untouched by the scrub"; else _no "scrub deleted Cookies"; fi
 
-python3 - "$pdefault/Login Data" <<'PY'
-import sqlite3, sys
-c = sqlite3.connect(sys.argv[1])
-c.execute("create table logins (origin_url text, username_value text, password_value blob)")
-c.commit(); c.close()
-PY
+fixture_login_store "$pdefault/Login Data"
 h_out="$(harden_run)"
 case "$h_out" in *scrubbed*) _no "harden scrub-noticed an empty store" ;; *) _ok "empty password store: no scrub notice" ;; esac
 if [ -f "$pdefault/Login Data" ]; then _ok "empty store left in place"; else _no "empty store was deleted"; fi
@@ -242,14 +229,7 @@ fi
 
 # mixed counts: readable store + unreadable store — count is qualified, not silently low
 rm -f "$pdefault/Login Data"
-python3 - "$pdefault/Login Data" <<'PY'
-import sqlite3, sys
-c = sqlite3.connect(sys.argv[1])
-c.execute("create table logins (origin_url text, username_value text, password_value blob)")
-c.execute("insert into logins values ('https://github.com','will',x'00')")
-c.execute("insert into logins values ('https://example.com','will',x'00')")
-c.commit(); c.close()
-PY
+fixture_login_store "$pdefault/Login Data" "https://github.com" "https://example.com"
 printf 'garbage-not-sqlite' >"$pdefault/Login Data For Account"
 h_out="$(harden_run)"
 assert_contains "mixed scrub reports the known count" "$h_out" "scrubbed 2 saved password"
@@ -285,13 +265,7 @@ up_rc=$?
 up_out="$(WSL_CDP_PORT=$srv_port WSL_CDP_PROXY_PORT=9346 "$CLI" up 2>/dev/null)"
 # no-launch path + saved passwords present: up must flag pending hygiene
 rm -f "$pdefault/Login Data"
-python3 - "$pdefault/Login Data" <<'PY'
-import sqlite3, sys
-c = sqlite3.connect(sys.argv[1])
-c.execute("create table logins (origin_url text, username_value text, password_value blob)")
-c.execute("insert into logins values ('https://github.com','will',x'00')")
-c.commit(); c.close()
-PY
+fixture_login_store "$pdefault/Login Data" "https://github.com"
 up_hyg="$(WSL_CDP_PORT=$srv_port WSL_CDP_PROXY_PORT=9346 \
   WSL_CDP_USERS_ROOT="$fx4/users" WSL_CDP_WINUSER=testuser \
   HOME="$fx4/home" "$CLI" up 2>&1 >/dev/null)"
